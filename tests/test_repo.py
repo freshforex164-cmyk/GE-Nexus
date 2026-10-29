@@ -16,6 +16,7 @@ ABOUT = ("GE Nexus is a Python stock-analysis toolkit with eleven existing Claud
 ORDER_PATH = ["trader-scanner", "trader-entry", "trader-exit", "trader-timemachine", "trader-budget",
               "trader-pelosi", "trader-risk", "trader-broker", "trader-alerts"]
 V1_ONLY = ["trader-copycat", "trader-screener", "trader-tax", "trader-rebalance"]
+PYTHON_DIRS = SKILLS + ["trader-ai"]
 
 
 def frontmatter(path):
@@ -43,9 +44,9 @@ class Repo(unittest.TestCase):
     def test_root_matches_the_reel(self):
         workspace_dirs = {".agents", ".cache", ".local", "attached_assets"}
         root = sorted(d for d in os.listdir(ROOT)
-                      if not d.startswith(".git") and d not in workspace_dirs)
-        self.assertEqual(root, sorted([".claude-plugin", ".replit", "GE_NEXUS_PROJECT_GUIDE.md",
-                                       "LICENSE", "README.md", "tests"] + SKILLS))
+                      if d != ".git" and d not in workspace_dirs)
+        self.assertEqual(root, sorted([".claude-plugin", ".gitignore", ".replit", "GE_NEXUS_PROJECT_GUIDE.md",
+                                       "LICENSE", "README.md", "tests", "trader-ai"] + SKILLS))
 
     def test_frontmatter_name_and_description(self):
         for s in SKILLS:
@@ -110,7 +111,7 @@ class Repo(unittest.TestCase):
 
     def test_every_tool_runs_on_python_3_8(self):
         # no 3.9+ only modules or syntax in the tools (the README promises 3.8)
-        for s in SKILLS:
+        for s in PYTHON_DIRS:
             folder = os.path.join(ROOT, s)
             for f in os.listdir(folder):
                 if not f.endswith(".py"):
