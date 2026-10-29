@@ -1,7 +1,13 @@
 modules = ["python-3.12"]
 
+run = "python3 trader-timemachine/timemachine.py"
+
 [nix]
 channel = "stable-25_05"
 
 [agent]
 expertMode = true
+
+[deployment]
+deploymentTarget = "cloudrun"
+run = "python3 trader-timemachine/timemachine.py"
