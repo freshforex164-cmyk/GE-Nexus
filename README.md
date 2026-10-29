@@ -1,27 +1,31 @@
-# The Day Trader skill
+# GE Nexus
 
-11 Claude skills for day trading: scan thousands of charts, track breaking news, time every entry and exit, and replay every outcome before you risk a dollar.
+GE Nexus is a Python stock-analysis toolkit with eleven existing Claude skill instructions. Its core command-line tools calculate scans, entry and exit plans, simulations, position sizes, and risk checks without an AI API key.
 
-Free, MIT, no signup, no API key. The tools are plain Python that read free
-public data: Yahoo Finance charts, Nasdaq Trader's symbol lists, SEC EDGAR
-and the House Clerk.
+The tools are plain Python that read public data from Yahoo Finance charts,
+Nasdaq Trader's symbol lists, SEC EDGAR and the House Clerk. Core analysis does
+not call an AI provider.
 
-One scans thousands of charts for setups. Another tracks breaking news on
-every stock you watch. One watches a setup bar by bar and tells you the moment
-to get in, and another sets your stop and your target before you do. And the
-craziest one is the Time Machine: before you risk a dollar, it replays the
-rest of the session 10,000 times from the stock's own recent bars, plus every
-past day the same setup fired, and tells you the honest odds.
+The repository remains a collection of Python command-line tools, not a web
+application or a complete trading service. The scripts produce analysis and
+structured files; they do not replace a user's review or guarantee a trade
+outcome.
 
-And no trade goes through until you say yes. Nothing in this pack can place
-an order on its own. Paper trading is the default.
+The Python tools do not submit orders. The existing broker skill can prepare a
+ticket for a separately configured broker connector, subject to its approval
+steps. This foundation stage adds no AI provider integration.
 
-> **Looking for the original Trader skill?** Copy an investor's 13F, the
-> stock screener, tax lots and rebalancing live in
-> [github.com/Jakeschincariol/trader-skill](https://github.com/Jakeschincariol/trader-skill).
-> This repo is its day-trading sequel: the Trader skill v2.
+> **Upstream attribution:** GE Nexus is based on
+> [Jakeschincariol/day-trader-skill](https://github.com/Jakeschincariol/day-trader-skill).
+> Its existing Python tools, skill paths, and MIT license are preserved. The
+> original Trader skill, with 13F, stock screening, tax lots, and rebalancing,
+> remains at [Jakeschincariol/trader-skill](https://github.com/Jakeschincariol/trader-skill).
 
-## Install
+## Existing Claude skill integration
+
+The existing `trader-*/SKILL.md` files and plugin manifest describe how Claude
+can invoke the command-line tools. This integration is optional for the Python
+engine and does not add an AI provider API client.
 
 Paste this into Claude:
 
@@ -48,14 +52,13 @@ cp -r day-trader-skill/trader-* ~/.claude/skills/
 ```
 
 Project-local instead of global: copy the same folders into your repo's
-`.claude/skills/`. No Claude Code at all? Paste any single `SKILL.md` at the
-top of a chat and it runs as a mode. You lose the Python tools, but the method
-works.
+`.claude/skills/`. Without Claude Code, run the Python commands in the core
+usage guide below directly from the repository.
 
 The tools need Python 3.8 or newer. Nothing to pip install. The SEC tools
-(news filings, the analyst) ask you to identify yourself: put your name and
-email in `trader/config.json` (`"sec_user_agent": "Your Name you@example.com"`)
-or in the `SEC_USER_AGENT` environment variable.
+(news filings, the analyst) require an identifying name and email in
+`trader/config.json` (`sec_user_agent`) or the `SEC_USER_AGENT` environment
+variable. This is an SEC request identification requirement, not an AI API key.
 
 ## The eleven
 
@@ -65,12 +68,12 @@ or in the `SEC_USER_AGENT` environment variable.
 | `/trader-news` | News Monitor | Tracks breaking news on every stock you watch and flags what moves it. |
 | `/trader-entry` | Entry Timer | Watches a setup bar by bar and tells you the moment to get in. |
 | `/trader-exit` | Exit Planner | Sets your stop and your target before you enter, so you know when to get out. |
-| `/trader-timemachine` | Time Machine | Replays every possible outcome of a trade before you risk a dollar: 10,000 simulated sessions plus every past time the setup fired. |
-| `/trader-risk` | Risk Manager | Checks every trade against your limits and stops anything over them. |
+| `/trader-timemachine` | Time Machine | Replays simulated sessions and historical occurrences of the same setup. |
+| `/trader-risk` | Risk Manager | Checks proposed orders against configured limits and reports PASS or BLOCK. |
 | `/trader-budget` | Budget Manager | Sizes every position to your budget and your max loss per trade. |
-| `/trader-broker` | Order Executor | Sends approved orders to your broker, paper trading by default, never without your yes. |
+| `/trader-broker` | Broker Tickets | Prepares and checks tickets for a separately configured broker connector. |
 | `/trader-alerts` | Price Alerts | Rings when a price, a stop or the opening bell hits. |
-| `/trader-analyst` | Earnings Analyst | Reads earnings reports and sums up what changed. |
+| `/trader-analyst` | Earnings Analyst | Calculates changes in reported SEC XBRL financial metrics. |
 | `/trader-pelosi` | Pelosi Tracker | Reads Congress's stock-trade disclosures the minute they are filed. |
 
 ## How to use it
@@ -83,6 +86,9 @@ scanner -> news -> entry -> exit -> timemachine -> budget -> risk -> broker   (o
 alerts: stop, target, flat by the close                                       (while it is open)
 news / analyst / pelosi                                                        (on a schedule)
 ```
+
+This is a documented sequence, not a central Python coordinator. Run each
+command yourself; its output files can be used by later commands.
 
 An example, the trade in the reel: Tesla, Monday October 19 2026, real data.
 
@@ -120,34 +126,97 @@ An example, the trade in the reel: Tesla, Monday October 19 2026, real data.
 9. **`/trader-alerts`** rings on the stop, the target and at 3:55 PM to
    flatten whatever is still open.
 
-## The tools
+## Core-only usage (no AI API key)
 
-All standard-library Python. The data tools read public endpoints and are
-polite about it.
+The analysis commands below invoke the existing Python scripts directly and
+do not require Claude or another AI provider. Commands that write results use
+the repository's existing `trader/` JSON and text files.
 
-```bash
-python3 trader-scanner/scan.py universe                                # ~5,900 US stocks, Nasdaq Trader
-python3 trader-scanner/scan.py daily                                   # pre-market setups, whole universe
-python3 trader-scanner/scan.py orb --at 10:15                          # opening-range breakouts so far
-python3 trader-news/news.py --tickers TSLA --hours 12                  # headlines, 8-Ks, today's move
-python3 trader-entry/entry.py check TSLA --setup orb                   # waiting / triggered / expired
-python3 trader-entry/entry.py watch TSLA --every 30                    # bar by bar until it triggers
-python3 trader-exit/exit.py plan --stop or-mid --target 1R --write     # -> trader/plan.json
-python3 trader-timemachine/timemachine.py run --write                  # 10,000 replays + the history
-python3 trader-budget/size.py --write                                  # -> trader/orders.json
-python3 trader-risk/check.py                                           # PASS / BLOCK per order
-python3 trader-broker/ticket.py show                                   # the tickets, READY or not
-python3 trader-alerts/alerts.py add --from-plan                        # stop, target, flat by close
-python3 trader-alerts/alerts.py check                                  # rings what hit, once
-python3 trader-analyst/facts.py TSLA                                   # quarters, growth, EPS
-python3 trader-pelosi/ptr.py index --member pelosi                     # her PTRs this year
-```
+1. Refresh the supported stock universe, then inspect its saved symbols:
+
+   ```bash
+   python3 trader-scanner/scan.py universe
+   sed -n '1,20p' trader/universe.txt
+   ```
+
+   `universe` retrieves Nasdaq Trader symbol lists and writes
+   `trader/universe.txt`. The scanner also accepts `--offline DIR` for saved
+   symbol-list files and `--no-write` to avoid saving the result.
+
+2. Run either the daily scan or the opening-range scan. Each writes
+   `trader/watchlist.json`; running the second replaces the first scan's
+   watchlist.
+
+   ```bash
+   python3 trader-scanner/scan.py daily
+   python3 trader-scanner/scan.py orb --at 10:15
+   ```
+
+   `--at` pins the scan time in New York time. Review the watchlist with:
+
+   ```bash
+   python3 -m json.tool trader/watchlist.json
+   ```
+
+3. Check a symbol's existing opening-range setup rule:
+
+   ```bash
+   python3 trader-entry/entry.py check TSLA --setup orb --json
+   ```
+
+   This reports the current rule-based status. Add `--write` if you need
+   `trader/entry.json` for the exit planner. Only continue to an exit plan
+   when the entry result meets the tool's prerequisites, including a triggered
+   entry. Use `--offline FILE` with a saved chart fixture/file when applicable.
+
+4. Generate a plan from a qualifying saved entry:
+
+   ```bash
+   python3 trader-exit/exit.py plan --stop or-mid --target 1R --write
+   ```
+
+   This reads `trader/entry.json` and writes the existing
+   `trader/plan.json` format. ATR stops can use `--offline FILE`; other stop
+   types do not require bars for the stop calculation.
+
+5. Run the historical Time Machine for an existing plan:
+
+   ```bash
+   python3 trader-timemachine/timemachine.py run --write
+   ```
+
+   This invocation reads `trader/plan.json`; supported CLI flags can supply
+   plan values instead. Historical bars are required. Use `--offline FILE`
+   with a saved Yahoo chart file where available. The simulation is a
+   historical resampling exercise, not a prediction.
+
+6. Size a proposed order and check its risk, when the inputs are configured:
+
+   ```bash
+   python3 trader-budget/size.py --write
+   python3 trader-risk/check.py --json --no-write
+   ```
+
+   Sizing needs a plan and configured budget/risk settings; start from
+   `trader-budget/config.example.json` when creating `trader/config.json`.
+   Risk checking needs the proposed `trader/orders.json` and applicable
+   configuration. The sizing script writes a proposal; neither command
+   submits it. The risk command's `--no-write` option avoids recording a
+   verdict in the runtime state file.
+
+Some commands retrieve public data online. Applicable data tools support
+`--offline` inputs, and the existing tests use local fixtures; not every
+command has an offline mode. Public data availability and latency are not
+guaranteed. Yahoo Finance data is unofficial and may be delayed; it is not
+guaranteed real-time data. Detected setups are not confirmed trade
+opportunities. These scripts are analysis tools, not financial advice or a
+complete trading application.
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-The tests run offline, on fixtures cut from real data: TSLA's 5-minute bars
+The tests run offline on fixtures cut from real data: TSLA's 5-minute bars
 for the 60 days to October 19 2026, the 10:15 AM opening-range scan, Yahoo's
 TSLA headlines that morning, the House Clerk's 2026 index, real PTR text and
 real XBRL facts. They reproduce every number in the example above.

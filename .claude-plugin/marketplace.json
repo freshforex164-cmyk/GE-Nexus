@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "day-trader-skill",
-  "description": "The Day Trader skill pack for Claude: the Trader skill v2",
+  "description": "GE Nexus is a Python stock-analysis toolkit with optional Claude skill instructions for its existing command-line tools.",
   "owner": {
     "name": "Jake Schincariol",
     "url": "https://opusjake.ai"
@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "day-trader-skill",
-      "description": "Eleven Claude skills for day trading: a chart scanner, a news monitor, an entry timer, an exit planner, a time machine that replays 10,000 sessions, a risk manager, a budget manager, an order executor (paper by default, never without your yes), price alerts, an earnings analyst and a Pelosi tracker.",
+      "description": "GE Nexus includes Python command-line tools for stock analysis and eleven existing Claude skill instructions. The tools produce analysis and proposed tickets; broker execution uses a separate connector.",
       "source": "./",
       "category": "productivity",
       "homepage": "https://github.com/Jakeschincariol/day-trader-skill"

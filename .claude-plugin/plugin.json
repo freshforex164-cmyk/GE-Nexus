@@ -1,6 +1,6 @@
 {
   "name": "day-trader-skill",
-  "description": "11 Claude skills for day trading: scan thousands of charts, track breaking news, time every entry and exit, and replay every outcome before you risk a dollar.",
+  "description": "GE Nexus is a Python stock-analysis toolkit with eleven existing Claude skill instructions. Its core command-line tools calculate scans, entry and exit plans, simulations, position sizes, and risk checks without an AI API key.",
   "version": "2.0.0",
   "author": {
     "name": "Jake Schincariol",

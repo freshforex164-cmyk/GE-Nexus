@@ -9,8 +9,9 @@ from _load import ROOT
 SKILLS = ["trader-scanner", "trader-news", "trader-entry", "trader-exit", "trader-timemachine",
           "trader-risk", "trader-budget", "trader-broker", "trader-alerts", "trader-analyst",
           "trader-pelosi"]
-ABOUT = ("11 Claude skills for day trading: scan thousands of charts, track breaking news, time every "
-         "entry and exit, and replay every outcome before you risk a dollar.")
+ABOUT = ("GE Nexus is a Python stock-analysis toolkit with eleven existing Claude skill instructions. "
+         "Its core command-line tools calculate scans, entry and exit plans, simulations, position sizes, "
+         "and risk checks without an AI API key.")
 # skills on the way to an order carry the safety block
 ORDER_PATH = ["trader-scanner", "trader-entry", "trader-exit", "trader-timemachine", "trader-budget",
               "trader-pelosi", "trader-risk", "trader-broker", "trader-alerts"]
@@ -26,7 +27,7 @@ def frontmatter(path):
 
 def every_text_file():
     for base, dirs, files in os.walk(ROOT):
-        dirs[:] = [d for d in dirs if d not in (".git", "__pycache__")]
+        dirs[:] = [d for d in dirs if d not in (".git", "__pycache__", ".agents", ".cache", ".local")]
         for f in files:
             if f.endswith((".md", ".py", ".json", ".csv", ".txt", ".xml")) or f == "LICENSE":
                 yield os.path.join(base, f)
@@ -39,8 +40,10 @@ class Repo(unittest.TestCase):
         self.assertEqual(found, sorted(SKILLS))
 
     def test_root_matches_the_reel(self):
-        root = sorted(d for d in os.listdir(ROOT) if not d.startswith(".git"))
-        self.assertEqual(root, sorted([".claude-plugin", "LICENSE", "README.md", "tests"] + SKILLS))
+        workspace_dirs = {".agents", ".cache", ".local"}
+        root = sorted(d for d in os.listdir(ROOT)
+                      if not d.startswith(".git") and d not in workspace_dirs)
+        self.assertEqual(root, sorted([".claude-plugin", ".replit", "LICENSE", "README.md", "tests"] + SKILLS))
 
     def test_frontmatter_name_and_description(self):
         for s in SKILLS:
@@ -67,15 +70,18 @@ class Repo(unittest.TestCase):
             market = json.load(fh)
         self.assertEqual(market["name"], "day-trader-skill")
         self.assertEqual(market["plugins"][0]["name"], "day-trader-skill")
+        self.assertIn("GE Nexus", market["description"])
+        self.assertIn("GE Nexus", market["plugins"][0]["description"])
 
     def test_readme_carries_the_reel_copy(self):
         with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as fh:
             readme = " ".join(fh.read().split())
-        self.assertTrue(readme.startswith("# The Day Trader skill"))
+        self.assertTrue(readme.startswith("# GE Nexus"))
         for line in (ABOUT,
                      "https://github.com/Jakeschincariol/day-trader-skill install skill",
                      "/plugin marketplace add Jakeschincariol/day-trader-skill",
                      "/plugin install day-trader-skill@day-trader-skill",
+                     "## Core-only usage (no AI API key)",
                      "## Fine print"):
             self.assertIn(line, readme)
         for s in SKILLS:
