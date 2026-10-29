@@ -11,10 +11,13 @@ investigation.
 
 - **Implemented and verified:** the stock-analysis Python CLI tools, their
   deterministic calculations, structured file handoffs, and offline fixture
-  tests.
+  tests are present in this checkout. The Stage 1 report records 315 passing
+  tests; they were not rerun for this guide update.
 - **Implemented, not verified against live services:** code paths that
-  retrieve public market, SEC, or House Clerk data; the external broker
-  connector setup documented by the existing Claude skill.
+  retrieve public market, SEC, or House Clerk data. The Python broker-ticket
+  tool records local ticket state but does not call a broker; a separately
+  configured connector is described in existing Claude instructions, but was
+  not verified or configured here.
 - **Planned, not implemented:** a GE Nexus AI coordinator and configurable AI
   provider fallback.
 - **Known limits:** public data can be delayed or unavailable; this repository
@@ -37,11 +40,20 @@ snapshot. Tools create or use those files when run.
   trading-research toolkit built around deterministic Python tools. The
   coordinator is a future capability, not an implemented one.
 
-At guide creation, Git reported branch `main`, a clean working tree, and latest
-commit `f940c12` (`Update plugin metadata, documentation, and tests`). No
-root-level `AGENTS.md`, `replit.md`, or `CONTRIBUTING.md` was found in the
-inspected project paths. `README.md` and each tool's `SKILL.md` are the main
-current documentation.
+At this review, the imported Git checkout is on `main` at `7b1d336`
+(`Add project guide and update repository tests`). The tracked working tree
+was clean before this documentation update. Git reports this as a shallow,
+grafted repository, so the full parent history is unavailable. The Stage 1
+report below names `f940c12`; that commit cannot be confirmed from the history
+available in this checkout and is retained only as a historical report, not
+the current HEAD.
+
+The guide was already present in the imported snapshot. The root `.replit`
+selects Python 3.12 but defines no run command, and no Replit workflow was
+configured at review time. No root-level `AGENTS.md`, `replit.md`, or
+`CONTRIBUTING.md` was found in the inspected project paths. `README.md` and
+the eleven tool-specific `SKILL.md` files are the main usage documentation;
+`.replit` contains environment configuration, not project instructions.
 
 ## 2. Vision and intended workflow
 
@@ -135,13 +147,17 @@ scan.py universe -> trader/universe.txt
 scan.py daily/orb -> trader/watchlist.json -> entry.py and news.py
 entry.py -> trader/entry.json -> exit.py -> trader/plan.json
 trader/plan.json -> timemachine.py, size.py, alerts.py, and news.py
-alerts.py -> trader/prices.json -> size.py and risk/check.py
+alerts.py quote --write -> trader/prices.json -> size.py and risk/check.py
 size.py -> trader/orders.json -> risk/check.py -> broker/ticket.py
 ```
 
-Other outputs include optional `trader/metrics.json` from the analyst,
-`trader/state/news.json`, alert state, risk state, broker-ticket state, and
-Pelosi tracking state. These are separate outputs, not evidence of a live
+The price-file handoff is conditional: `trader-alerts/alerts.py quote` writes
+`trader/prices.json` only when requested with `--write`. Alert rules are
+separately stored in `trader/state/alerts.json`. Other outputs include
+`trader/timemachine.json`, optional `trader/metrics.json` from the analyst,
+`trader/state/news.json`, `trader/state/risk.json`,
+`trader/state/broker.json`, `trader/portfolio.json`, and Pelosi tracking state
+under `trader/state/`. These are separate outputs, not evidence of a live
 trade. Exact fields, nullable values, prerequisites, and readers must be
 checked against the current writer and consumer code. The repository does not
 define a shared formal JSON schema.
@@ -162,9 +178,8 @@ Configuration and data notes:
 
 ## 6. Stage 1 accomplishments
 
-Stage 1 established the project identity and documented use of the core
-without an AI API key. The following changes were committed as
-`f940c12`:
+The Stage 1 completion report says that the project identity and core use
+without an AI API key were established. It lists these changes:
 
 - `README.md`: GE Nexus branding, upstream attribution, and core-only usage
   instructions.
@@ -175,7 +190,7 @@ without an AI API key. The following changes were committed as
 - `tests/test_repo.py`: updated branding checks and repository-layout
   handling.
 
-Reported and verified Stage 1 checks:
+The report records these historical checks:
 
 - `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v`
   completed with **315 tests passing**.
@@ -190,7 +205,11 @@ synthetic test state, not real broker executions. Do not describe local test
 statuses as real trades. Future test selection must respect any explicit
 instruction not to simulate an executed order.
 
-These are Stage 1 results, not a guarantee that later changes pass the suite.
+These are historical Stage 1 results, not a guarantee that the current checkout
+or later changes pass the suite. This guide update did not rerun the unit tests
+or contact external services. The current imported checkout is shallow and
+does not expose the report's cited `f940c12` commit; see the Git provenance
+note above.
 
 ## 7. AI coordinator design for Stage 2
 
@@ -279,6 +298,9 @@ verified while preparing this guide.
 - Stage 1 foundation and branding are complete.
 - The Python tools remain the core analysis engine and do not require AI
   credentials.
+- This guide was already present in the imported checkout and has been updated
+  against the current repository snapshot. No source code, strategies, or
+  runtime configuration were changed for this documentation update.
 - Stage 2 provider integration and tool coordination have not started.
 - The next intended milestone is an optional AI coordinator with the planned
   provider fallback, preserving the Python-only tools.
@@ -289,6 +311,7 @@ verified while preparing this guide.
 
 | Stage | Work completed | Verification | Remaining work |
 |---|---|---|---|
-| Stage 1 - complete | GE Nexus identity, core-only README guide, plugin descriptions, and repository checks. | 315 unit tests passed; `git diff --check` passed; no live-data or broker operation performed. Broker-flow tests use synthetic local placement/fill state. | Add this persistent handoff guide; keep core interfaces unchanged. |
+| Stage 1 - historical | GE Nexus identity, core-only README guide, plugin descriptions, and repository checks, as reported in the Stage 1 completion report. | The report records 315 passing unit tests and `git diff --check`; no live-data or broker operation was performed. Broker-flow tests use synthetic local placement/fill state. Results were not rerun for this guide update. | Continue preserving core interfaces; implement the optional AI coordinator only as a separately approved milestone. |
+| Handoff guide - reviewed 2026-10-29 | The guide was already present in the imported snapshot; its status, Git provenance, and conditional price-file handoff were reconciled with the current files. | Documentation-only change; `git diff --check` passed. No unit tests, live-data requests, provider calls, or broker operations were run. | Keep this guide current after future development stages. |
 | Stage 2 - pending | Nothing implemented. | Not run. | Add optional AI coordination and provider fallback while keeping the deterministic Python engine independent. |
 | Deployment assessment - future | Nothing implemented or verified. | Not run. | Assess hosting only after AI coordination and offline/failure behavior are verified. |
