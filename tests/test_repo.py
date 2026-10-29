@@ -27,7 +27,8 @@ def frontmatter(path):
 
 def every_text_file():
     for base, dirs, files in os.walk(ROOT):
-        dirs[:] = [d for d in dirs if d not in (".git", "__pycache__", ".agents", ".cache", ".local")]
+        dirs[:] = [d for d in dirs if d not in (
+            ".git", "__pycache__", ".agents", ".cache", ".local", "attached_assets")]
         for f in files:
             if f.endswith((".md", ".py", ".json", ".csv", ".txt", ".xml")) or f == "LICENSE":
                 yield os.path.join(base, f)
@@ -40,10 +41,11 @@ class Repo(unittest.TestCase):
         self.assertEqual(found, sorted(SKILLS))
 
     def test_root_matches_the_reel(self):
-        workspace_dirs = {".agents", ".cache", ".local"}
+        workspace_dirs = {".agents", ".cache", ".local", "attached_assets"}
         root = sorted(d for d in os.listdir(ROOT)
                       if not d.startswith(".git") and d not in workspace_dirs)
-        self.assertEqual(root, sorted([".claude-plugin", ".replit", "LICENSE", "README.md", "tests"] + SKILLS))
+        self.assertEqual(root, sorted([".claude-plugin", ".replit", "GE_NEXUS_PROJECT_GUIDE.md",
+                                       "LICENSE", "README.md", "tests"] + SKILLS))
 
     def test_frontmatter_name_and_description(self):
         for s in SKILLS:
