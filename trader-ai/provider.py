@@ -213,7 +213,7 @@ def chat_completion(
             continue
 
         model = env.get(spec.model_env, "") or spec.default_model
-        if spec.name != "OpenRouter" and (not isinstance(model, str) or not model.strip()):
+        if not isinstance(model, str) or not model.strip():
             attempts.append({"provider": spec.name, "category": "missing_model"})
             continue
         if model is not None and (not isinstance(model, str) or len(model) > 200):

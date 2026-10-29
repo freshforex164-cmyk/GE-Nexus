@@ -127,6 +127,25 @@ class PlanValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(coordinator.PlanError, "earlier action"):
             coordinator.validate_plan(plan(items), "Check TSLA risk")
 
+    def test_unhashable_dependency_is_rejected_as_a_plan_error(self):
+        items = [action("alerts_clock"), action("risk_check", dependencies=[["a1"]])]
+        with self.assertRaisesRegex(coordinator.PlanError, "earlier action"):
+            coordinator.validate_plan(plan(items), "Check the exchange clock")
+
+    def test_generated_file_consumers_require_prior_action_dependencies(self):
+        actions = [
+            action("exit_plan", {
+                "symbol": "TSLA", "entry": 100, "stop": "price:99",
+            }),
+            action("alerts_quote", {"symbols": ["TSLA"]}),
+            action("budget_size", dependencies=["a1"]),
+        ]
+        with self.assertRaisesRegex(coordinator.PlanError, "prior alerts_quote"):
+            coordinator.validate_plan(
+                plan(actions),
+                "Plan TSLA exit, check the TSLA quote, and size it",
+            )
+
     def test_rejects_wrong_ids_output_types_and_excess_calls(self):
         wrong_type = plan([action("alerts_clock")])
         wrong_type["actions"][0]["expected_output"] = "text"
@@ -246,6 +265,26 @@ class ExecutionTests(unittest.TestCase):
                 )
         self.assertEqual(timed_out["category"], "tool_timeout")
         self.assertEqual(too_large["category"], "tool_output_too_large")
+
+    def test_live_pipe_capture_is_bounded_for_stdout_and_stderr(self):
+        def noisy_run(command, **kwargs):
+            os.write(kwargs["stdout"], b"x" * (coordinator.MAX_TOOL_OUTPUT_BYTES + 1))
+            os.write(kwargs["stderr"], b"y" * 128)
+            return subprocess.CompletedProcess(command, 0, None, None)
+
+        with tempfile.TemporaryDirectory() as temp:
+            with mock.patch.object(coordinator.subprocess, "run", side_effect=noisy_run):
+                completed, stdout, stderr, overflow = coordinator._run_bounded_subprocess(
+                    [sys.executable, "-c", "pass"],
+                    coordinator.Path(temp),
+                    {},
+                    5,
+                )
+        self.assertEqual(completed.returncode, 0)
+        self.assertTrue(overflow)
+        self.assertLessEqual(
+            len(stdout) + len(stderr), coordinator.MAX_TOOL_OUTPUT_BYTES
+        )
 
     def test_failed_prerequisite_skips_dependent_action(self):
         checked = coordinator.validate_plan(

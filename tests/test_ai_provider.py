@@ -18,6 +18,7 @@ def completion(text="ok"):
 def configured():
     return {
         "OPENROUTER_API_KEY": "router-test-secret",
+        "OPENROUTER_MODEL": "openai/gpt-4",
         "OPENAI_API_KEY": "openai-test-secret",
         "GROK_API_KEY": "grok-test-secret",
         "DEEPSEEK_API_KEY": "deepseek-test-secret",
@@ -114,6 +115,19 @@ class ProviderTests(unittest.TestCase):
             ["missing_key", "missing_key", "missing_key"],
         )
 
+    def test_openrouter_without_model_is_skipped(self):
+        env = configured()
+        env.pop("OPENROUTER_MODEL")
+        calls = []
+        result = provider.chat_completion(
+            [{"role": "user", "content": "Analyze TSLA"}],
+            environ=env,
+            post_json=lambda *args: calls.append(args) or completion("openai response"),
+        )
+        self.assertEqual(result["provider"], "OpenAI")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(result["attempts"][0]["category"], "missing_model")
+
     def test_all_provider_failures_return_safe_structured_error(self):
         secret = "do-not-display-this-key"
 
@@ -126,7 +140,7 @@ class ProviderTests(unittest.TestCase):
                 environ={key: secret for key in (
                     "OPENROUTER_API_KEY", "OPENAI_API_KEY",
                     "GROK_API_KEY", "DEEPSEEK_API_KEY",
-                )},
+                )} | {"OPENROUTER_MODEL": "openai/gpt-4"},
                 post_json=fail,
             )
         error = context.exception.as_dict()
@@ -217,6 +231,25 @@ class ProviderTests(unittest.TestCase):
                         environ={"OPENROUTER_API_KEY": "router-test-secret"},
                         post_json=lambda *args, value=body: value,
                     )
+
+    def test_invalid_content_schema_falls_back_to_next_provider(self):
+        calls = []
+
+        def malformed_then_valid(url, headers, payload, timeout):
+            calls.append(url)
+            if len(calls) == 1:
+                return completion("not JSON")
+            return completion('{"valid":true}')
+
+        result = provider.chat_completion(
+            [{"role": "user", "content": "Return JSON"}],
+            environ=configured(),
+            post_json=malformed_then_valid,
+            validate_content=json.loads,
+        )
+        self.assertEqual(result["provider"], "OpenAI")
+        self.assertEqual(result["validated"], {"valid": True})
+        self.assertEqual(result["attempts"][0]["category"], "invalid_response")
 
     def test_model_overrides_are_used_without_logging_keys(self):
         seen = []

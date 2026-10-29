@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -374,21 +375,42 @@ def validate_plan(document, request):
         dependencies = action["depends_on"]
         if not isinstance(dependencies, list) or len(dependencies) > index:
             raise PlanError("depends_on must reference only earlier action ids")
-        if len(set(dependencies)) != len(dependencies):
-            raise PlanError("duplicate action dependency")
+        checked_dependencies = []
         for dependency in dependencies:
             if not isinstance(dependency, str) or dependency not in seen:
                 raise PlanError("dependency must reference an earlier action")
+            if dependency in checked_dependencies:
+                raise PlanError("duplicate action dependency")
+            checked_dependencies.append(dependency)
         expected = TOOL_CATALOG[tool]["output"]
         if action["expected_output"] != expected:
             raise PlanError("incorrect expected output type for %s" % tool)
         args = _validate_action_arguments(tool, action["arguments"], request)
+        required_tools = []
+        if tool == "exit_plan" and not args:
+            required_tools.append("entry_check")
+        if tool in ("timemachine", "budget_size"):
+            required_tools.append("exit_plan")
+        if tool == "budget_size":
+            required_tools.append("alerts_quote")
+        if tool == "risk_check":
+            required_tools.append("budget_size")
+        for required_tool in required_tools:
+            prior = next(
+                (item for item in reversed(normalized) if item["tool"] == required_tool),
+                None,
+            )
+            if prior is not None and prior["id"] not in checked_dependencies:
+                raise PlanError(
+                    "%s must depend on prior %s action %s"
+                    % (tool, required_tool, prior["id"])
+                )
         normalized.append(
             {
                 "id": expected_id,
                 "tool": tool,
                 "arguments": args,
-                "depends_on": list(dependencies),
+                "depends_on": checked_dependencies,
                 "expected_output": expected,
             }
         )
@@ -422,7 +444,10 @@ def planner_messages(request):
         "\"depends_on\":[],\"expected_output\":\"json or text\"}],"
         "\"clarification\":null}. Use sequential ids a1 to a4. Keep actions to at most "
         "four. If no tool can run yet, use actions:[] and a concise clarification string. "
-        "Dependencies can name only earlier action ids. Do not assume tool outputs are "
+        "Dependencies can name only earlier action ids. If an exit plan uses a prior "
+        "entry check, depend on it; time machine or sizing actions must depend on a prior "
+        "exit plan; a risk check must depend on prior sizing; sizing must depend on prior "
+        "quotes when included. Do not assume tool outputs are "
         "persisted in the project; intermediate files are private temporary files.\n\n"
         "Allowed tools:\n" + "\n".join(catalog)
     )
@@ -534,7 +559,74 @@ def _child_environment():
     env = os.environ.copy()
     for name in API_KEY_ENV_NAMES:
         env.pop(name, None)
+    for name in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP"):
+        env.pop(name, None)
+    env["PYTHONNOUSERSITE"] = "1"
     return env
+
+
+def _read_bounded_pipe(fd, name, buffers, capture_state):
+    try:
+        while True:
+            chunk = os.read(fd, 8192)
+            if not chunk:
+                break
+            with capture_state["lock"]:
+                remaining = MAX_TOOL_OUTPUT_BYTES - capture_state["size"]
+                kept = chunk[:remaining] if remaining > 0 else b""
+                if kept:
+                    buffers[name].extend(kept)
+                    capture_state["size"] += len(kept)
+                if len(kept) != len(chunk):
+                    capture_state["overflow"] = True
+    finally:
+        os.close(fd)
+
+
+def _run_bounded_subprocess(command, workspace, environment, timeout):
+    """Use subprocess.run while draining stdout/stderr into a fixed-size buffer."""
+    stdout_read, stdout_write = os.pipe()
+    stderr_read, stderr_write = os.pipe()
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    capture_state = {"lock": threading.Lock(), "size": 0, "overflow": False}
+    readers = [
+        threading.Thread(
+            target=_read_bounded_pipe,
+            args=(stdout_read, "stdout", buffers, capture_state),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=_read_bounded_pipe,
+            args=(stderr_read, "stderr", buffers, capture_state),
+            daemon=True,
+        ),
+    ]
+    for reader in readers:
+        reader.start()
+
+    completed = None
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=str(workspace),
+            env=environment,
+            shell=False,
+            stdout=stdout_write,
+            stderr=stderr_write,
+            timeout=timeout,
+            check=False,
+        )
+    finally:
+        os.close(stdout_write)
+        os.close(stderr_write)
+        for reader in readers:
+            reader.join()
+    return (
+        completed,
+        bytes(buffers["stdout"]),
+        bytes(buffers["stderr"]),
+        capture_state["overflow"],
+    )
 
 
 def _run_one(action, workspace, deadline):
@@ -547,17 +639,11 @@ def _run_one(action, workspace, deadline):
         }
     timeout = min(TOOL_TIMEOUT_SECONDS, remaining)
     try:
-        completed = subprocess.run(
+        completed, stdout_bytes, stderr_bytes, overflow = _run_bounded_subprocess(
             command,
-            cwd=str(workspace),
-            env=_child_environment(),
-            shell=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            check=False,
+            workspace,
+            _child_environment(),
+            timeout,
         )
     except subprocess.TimeoutExpired:
         return {
@@ -570,9 +656,23 @@ def _run_one(action, workspace, deadline):
             "category": "tool_start_failed",
         }
 
-    stdout = completed.stdout or ""
-    stderr = redact_sensitive(completed.stderr or "")
-    if len(stdout.encode("utf-8", "replace")) > MAX_TOOL_OUTPUT_BYTES:
+    # Keep test doubles and wrappers returning CompletedProcess output compatible;
+    # the real invocation streams directly into the bounded pipes above.
+    if completed.stdout is not None:
+        stdout_bytes = (
+            completed.stdout.encode("utf-8", "replace")
+            if isinstance(completed.stdout, str)
+            else completed.stdout
+        )
+    if completed.stderr is not None:
+        stderr_bytes = (
+            completed.stderr.encode("utf-8", "replace")
+            if isinstance(completed.stderr, str)
+            else completed.stderr
+        )
+    stdout = stdout_bytes.decode("utf-8", "replace")
+    stderr = redact_sensitive(stderr_bytes.decode("utf-8", "replace"))
+    if overflow or len(stdout_bytes) + len(stderr_bytes) > MAX_TOOL_OUTPUT_BYTES:
         return {
             "id": action["id"], "tool": action["tool"], "status": "failed",
             "category": "tool_output_too_large",
@@ -593,11 +693,18 @@ def _run_one(action, workspace, deadline):
 
     if action["expected_output"] == "json":
         try:
-            result["data"] = json.loads(stdout)
+            data = json.loads(stdout)
         except (ValueError, TypeError):
             result["category"] = "invalid_json_output"
             result["stdout_preview"] = redact_sensitive(stdout)[:2000]
             return result
+        if not isinstance(data, dict) or not data:
+            result["category"] = "invalid_json_output"
+            result["stdout_preview"] = redact_sensitive(stdout)[:2000]
+            return result
+        result["data"] = json.loads(
+            redact_sensitive(json.dumps(data, ensure_ascii=False))
+        )
     else:
         result["data"] = redact_sensitive(stdout)
         if not result["data"].strip():
@@ -656,7 +763,9 @@ def _action_output_for_model(results):
         if "returncode" in result:
             item["returncode"] = result["returncode"]
         if "data" in result:
-            serialized = json.dumps(result["data"], ensure_ascii=False, separators=(",", ":"))
+            serialized = redact_sensitive(
+                json.dumps(result["data"], ensure_ascii=False, separators=(",", ":"))
+            )
             truncated = len(serialized) > MAX_MODEL_ACTION_OUTPUT_CHARS
             item["data_preview"] = serialized[:MAX_MODEL_ACTION_OUTPUT_CHARS]
             item["truncated"] = truncated
@@ -717,16 +826,20 @@ def _interpret(request, plan, results, deadline):
         },
     ]
     try:
-        response = provider.chat_completion(messages, deadline=deadline)
+        response = provider.chat_completion(
+            messages, deadline=deadline, validate_content=_parse_interpretation
+        )
     except provider.ProviderUnavailable as exc:
         return None, exc.as_dict(), None
-    try:
-        parsed = _parse_interpretation(response["content"])
-    except ValueError:
-        return None, {
-            "category": "invalid_interpretation",
-            "message": "The selected provider returned an invalid interpretation. Python results are preserved below.",
-        }, response["provider"]
+    parsed = response.get("validated")
+    if parsed is None:
+        try:
+            parsed = _parse_interpretation(response["content"])
+        except ValueError:
+            return None, {
+                "category": "invalid_interpretation",
+                "message": "The selected provider returned an invalid interpretation. Python results are preserved below.",
+            }, response["provider"]
     return parsed, None, response["provider"]
 
 
@@ -750,7 +863,9 @@ def coordinate(request):
     deadline = time.monotonic() + MAX_TOTAL_SECONDS
     try:
         planned = provider.chat_completion(
-            planner_messages(request), deadline=deadline
+            planner_messages(request),
+            deadline=deadline,
+            validate_content=lambda content: validate_plan(content, request),
         )
     except provider.ProviderUnavailable as exc:
         return {
@@ -761,7 +876,9 @@ def coordinate(request):
             "interpretation": None,
         }
     try:
-        plan = validate_plan(planned["content"], request)
+        plan = planned.get("validated")
+        if plan is None:
+            plan = validate_plan(planned["content"], request)
     except PlanError as exc:
         return {
             "status": "plan_rejected",
@@ -797,9 +914,7 @@ def coordinate(request):
     base["interpretation"] = interpretation
     if error:
         base["interpretation_error"] = error
-    if all(item["status"] in ("completed", "skipped") for item in action_results) and not any(
-        item["status"] == "failed" for item in action_results
-    ):
+    if all(item["status"] == "completed" for item in action_results):
         base["status"] = "complete" if interpretation else "results_available"
     else:
         base["status"] = "partial"
