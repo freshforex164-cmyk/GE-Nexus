@@ -20,8 +20,11 @@ def configured():
         "OPENROUTER_API_KEY": "router-test-secret",
         "OPENROUTER_MODEL": "openai/gpt-4",
         "OPENAI_API_KEY": "openai-test-secret",
+        "OPENAI_MODEL": "gpt-test",
         "GROK_API_KEY": "grok-test-secret",
+        "GROK_MODEL": "grok-test",
         "DEEPSEEK_API_KEY": "deepseek-test-secret",
+        "DEEPSEEK_MODEL": "deepseek-test",
     }
 
 
@@ -105,7 +108,10 @@ class ProviderTests(unittest.TestCase):
         calls = []
         result = provider.chat_completion(
             [{"role": "user", "content": "Analyze TSLA"}],
-            environ={"DEEPSEEK_API_KEY": "deepseek-test-secret"},
+            environ={
+                "DEEPSEEK_API_KEY": "deepseek-test-secret",
+                "DEEPSEEK_MODEL": "deepseek-test",
+            },
             post_json=lambda *args: calls.append(args) or completion("ok"),
         )
         self.assertEqual(result["provider"], "DeepSeek")
@@ -114,6 +120,32 @@ class ProviderTests(unittest.TestCase):
             [item["category"] for item in result["attempts"]],
             ["missing_key", "missing_key", "missing_key"],
         )
+
+    def test_missing_model_configuration_skips_provider_without_network_call(self):
+        calls = []
+
+        def fail_first_provider(url, headers, payload, timeout):
+            calls.append(url)
+            raise provider.ProviderHTTPError(503)
+
+        with self.assertRaises(provider.ProviderUnavailable) as context:
+            provider.chat_completion(
+                [{"role": "user", "content": "Analyze TSLA"}],
+                environ={
+                    "OPENROUTER_API_KEY": "router-test-secret",
+                    "OPENROUTER_MODEL": "openai/gpt-4",
+                    "OPENAI_API_KEY": "openai-test-secret",
+                },
+                post_json=fail_first_provider,
+            )
+        self.assertEqual(len(calls), 1)
+        attempts = context.exception.as_dict()["attempts"]
+        self.assertEqual(attempts[0], {
+            "provider": "OpenRouter", "category": "server_error"
+        })
+        self.assertEqual(attempts[1], {
+            "provider": "OpenAI", "category": "missing_model"
+        })
 
     def test_openrouter_without_model_is_skipped(self):
         env = configured()
@@ -140,7 +172,12 @@ class ProviderTests(unittest.TestCase):
                 environ={key: secret for key in (
                     "OPENROUTER_API_KEY", "OPENAI_API_KEY",
                     "GROK_API_KEY", "DEEPSEEK_API_KEY",
-                )} | {"OPENROUTER_MODEL": "openai/gpt-4"},
+                )} | {
+                    "OPENROUTER_MODEL": "openai/gpt-4",
+                    "OPENAI_MODEL": "gpt-test",
+                    "GROK_MODEL": "grok-test",
+                    "DEEPSEEK_MODEL": "deepseek-test",
+                },
                 post_json=fail,
             )
         error = context.exception.as_dict()

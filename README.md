@@ -2,18 +2,21 @@
 
 GE Nexus is a Python stock-analysis toolkit with eleven existing Claude skill instructions. Its core command-line tools calculate scans, entry and exit plans, simulations, position sizes, and risk checks without an AI API key.
 
+The repository also includes an optional AI coordinator for those existing
+Python tools.
+
 The tools are plain Python that read public data from Yahoo Finance charts,
 Nasdaq Trader's symbol lists, SEC EDGAR and the House Clerk. Core analysis does
 not call an AI provider.
 
-The repository remains a collection of Python command-line tools, not a web
-application or a complete trading service. The scripts produce analysis and
-structured files; they do not replace a user's review or guarantee a trade
-outcome.
+The repository remains a collection of Python command-line tools, with an
+optional AI coordinator, not a web application or a complete trading service.
+The scripts produce analysis and structured files; they do not replace a
+user's review or guarantee a trade outcome.
 
-The Python tools do not submit orders. The existing broker skill can prepare a
-ticket for a separately configured broker connector, subject to its approval
-steps. This foundation stage adds no AI provider integration.
+The Python tools and AI coordinator do not submit orders. The existing broker
+skill can prepare a ticket for a separately configured broker connector,
+subject to its approval steps. Broker activity is outside the coordinator.
 
 > **Upstream attribution:** GE Nexus is based on
 > [Jakeschincariol/day-trader-skill](https://github.com/Jakeschincariol/day-trader-skill).
@@ -59,6 +62,52 @@ The tools need Python 3.8 or newer. Nothing to pip install. The SEC tools
 (news filings, the analyst) require an identifying name and email in
 `trader/config.json` (`sec_user_agent`) or the `SEC_USER_AGENT` environment
 variable. This is an SEC request identification requirement, not an AI API key.
+
+## Optional AI coordinator
+
+The coordinator can plan a request, validate it against a fixed allowlist of
+existing tools, run those Python tools in a temporary workspace, and explain
+their bounded results:
+
+```bash
+python3 trader-ai/coordinator.py "Check TSLA news and its entry setup"
+python3 trader-ai/coordinator.py --json "Check the exchange clock"
+```
+
+Supported actions are daily and opening-range scans, news, entry checks, exit
+plans, historical simulations, exchange-clock checks, quotes, SEC fundamental
+analysis, position sizing, and risk checks. Some actions require saved files
+from earlier tools. The coordinator asks for missing request details where
+possible and reports tool prerequisites or failures; it does not submit orders
+or call a broker. Public-data actions may contact their existing data sources.
+
+AI providers are attempted in this order: OpenRouter, OpenAI, Grok, then
+DeepSeek. Each provider needs both its API key and an explicitly configured
+model name. Set these environment variables using Replit Secrets or another
+secure environment-variable store, never in source files:
+
+| Provider | API key | Model |
+| --- | --- | --- |
+| OpenRouter | `OPENROUTER_API_KEY` | `OPENROUTER_MODEL` |
+| OpenAI | `OPENAI_API_KEY` | `OPENAI_MODEL` |
+| Grok | `GROK_API_KEY` | `GROK_MODEL` |
+| DeepSeek | `DEEPSEEK_API_KEY` | `DEEPSEEK_MODEL` |
+
+Choose a model identifier supported by your provider account. No model names
+are assumed by default. Optional endpoint overrides are `OPENROUTER_BASE_URL`,
+`OPENAI_BASE_URL`, `GROK_BASE_URL`, and `DEEPSEEK_BASE_URL`; they must be HTTPS
+chat-completions endpoints. Default endpoints are OpenRouter
+`https://openrouter.ai/api/v1/chat/completions`, OpenAI
+`https://api.openai.com/v1/chat/completions`, xAI
+`https://api.x.ai/v1/chat/completions`, and DeepSeek
+`https://api.deepseek.com/chat/completions`.
+
+Providers with missing keys or model names are skipped. Timeouts, rate limits,
+server errors, and invalid responses move to the next configured provider.
+If all providers are unavailable, the coordinator reports that AI assistance
+is unavailable; the existing Python commands continue to work without AI
+credentials. The provider request and tool execution are bounded, and model
+output cannot select arbitrary commands, code, or broker actions.
 
 ## The eleven
 
@@ -279,6 +328,7 @@ trader-broker/      SKILL.md, ticket.py, claude_desktop_config.example.json
 trader-alerts/      SKILL.md, alerts.py, alerts.example.json
 trader-analyst/     SKILL.md, facts.py, metrics.example.json
 trader-pelosi/      SKILL.md, ptr.py
+trader-ai/          optional provider adapter and restricted coordinator
 tests/              unittest suite + offline fixtures
 ```
 

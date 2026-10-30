@@ -44,7 +44,7 @@ PROVIDERS = (
         "OPENAI_MODEL",
         "OPENAI_BASE_URL",
         "https://api.openai.com/v1/chat/completions",
-        "gpt-6-astra",
+        None,
     ),
     ProviderSpec(
         "Grok",
@@ -52,7 +52,7 @@ PROVIDERS = (
         "GROK_MODEL",
         "GROK_BASE_URL",
         "https://api.x.ai/v1/chat/completions",
-        "grok-4.7",
+        None,
     ),
     ProviderSpec(
         "DeepSeek",
@@ -60,7 +60,7 @@ PROVIDERS = (
         "DEEPSEEK_MODEL",
         "DEEPSEEK_BASE_URL",
         "https://api.deepseek.com/chat/completions",
-        "deepseek-flash",
+        None,
     ),
 )
 

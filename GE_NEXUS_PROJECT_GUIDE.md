@@ -11,15 +11,16 @@ investigation.
 
 - **Implemented and verified:** the stock-analysis Python CLI tools, their
   deterministic calculations, structured file handoffs, and offline fixture
-  tests are present in this checkout. The Stage 1 report records 315 passing
-  tests; they were not rerun for this guide update.
+  tests are present in this checkout. Stage 1 historically reported 315
+  passing tests.
 - **Implemented, not verified against live services:** code paths that
   retrieve public market, SEC, or House Clerk data. The Python broker-ticket
   tool records local ticket state but does not call a broker; a separately
   configured connector is described in existing Claude instructions, but was
   not verified or configured here.
-- **Planned, not implemented:** a GE Nexus AI coordinator and configurable AI
-  provider fallback.
+- **Implemented and offline-tested:** the optional GE Nexus coordinator and
+  ordered provider adapter. No provider or live market-data calls were made
+  during Stage 2 verification.
 - **Known limits:** public data can be delayed or unavailable; this repository
   is not a web application or a complete trading service.
 
@@ -36,9 +37,9 @@ snapshot. Tools create or use those files when run.
 - The repository retains its existing tool folders and paths. The upstream
   MIT license is in `LICENSE`; the Claude plugin identifier remains
   `day-trader-skill` for compatibility.
-- The intended product is an AI-coordinated market-analysis and
-  trading-research toolkit built around deterministic Python tools. The
-  coordinator is a future capability, not an implemented one.
+- The product is an AI-coordinated market-analysis and trading-research toolkit
+  built around deterministic Python tools. The AI coordinator is optional; the
+  existing Python commands remain usable without provider credentials.
 
 At this review, the imported Git checkout is on `main` at `7b1d336`
 (`Add project guide and update repository tests`). The tracked working tree
@@ -57,7 +58,7 @@ the eleven tool-specific `SKILL.md` files are the main usage documentation;
 
 ## 2. Vision and intended workflow
 
-The intended coordinated workflow is:
+The coordinator supports a restricted version of the intended workflow:
 
 1. Understand the user's market-analysis request.
 2. Select and run the relevant existing Python tools.
@@ -70,10 +71,10 @@ The intended coordinated workflow is:
 9. Run risk checks.
 10. Combine the results into a clear explanation.
 
-This is a target workflow, not an automatically orchestrated pipeline. Today,
-the tool scripts are independent command-line programs. The README documents
-a possible sequence, and Claude skill instructions describe how Claude can
-invoke them. There is no central Python coordinator.
+The coordinator does not automate every step in this sequence. It validates
+each proposed action against a local allowlist and the existing CLI interface.
+User-specific files are copied to a temporary workspace for a run; generated
+files are discarded when that run ends.
 
 ## 3. What GE Nexus is and is not
 
@@ -86,17 +87,42 @@ invoke them. There is no central Python coordinator.
   levels, simulations, sizing, and risk verdicts.
 - Public-data retrieval code and local/offline fixture support where the
   individual command implements it.
+- An optional AI provider adapter and coordinator that validate model plans,
+  run allowlisted tools, and keep Python results separate from AI interpretation.
 
-### Planned, not implemented
+### AI coordinator scope
 
-- A GE Nexus AI coordinator to understand requests, choose tools, coordinate
-  workflows, and interpret structured results.
-- A configurable provider adapter with intended fallback order:
-  **OpenRouter -> OpenAI -> Grok/xAI -> DeepSeek**.
-
-No model client, provider fallback, or AI API integration currently exists in
-the Python code. Provider credentials and deployment configuration have not
-been inspected or verified.
+- Entry point: `python3 trader-ai/coordinator.py [--json] "request"`.
+- Supported actions: daily and opening-range scans, news, entry checks, exit
+  plans, historical simulation, exchange clock, quotes, SEC fundamental
+  analysis, position sizing, and risk checks.
+- The model can propose at most four actions. Local code validates plan schema,
+  symbols, numeric ranges, allowed arguments, dependencies, and output types.
+- Commands use fixed script paths, argument lists, `shell=False`, bounded
+  timeouts and output, and a temporary working directory. Provider keys are
+  removed from child-process environments.
+- Broker-ticket, approval, fill, flatten, arbitrary shell, arbitrary code, and
+  model-selected network actions are not in the allowlist.
+- Provider priority is OpenRouter -> OpenAI -> Grok/xAI -> DeepSeek. Each
+  provider requires both its API-key environment variable and its model-name
+  environment variable. No model defaults are assumed.
+- Default chat-completions endpoints are:
+  `https://openrouter.ai/api/v1/chat/completions`,
+  `https://api.openai.com/v1/chat/completions`,
+  `https://api.x.ai/v1/chat/completions`, and
+  `https://api.deepseek.com/chat/completions`. Optional HTTPS endpoint
+  overrides use `<PROVIDER>_BASE_URL`.
+- API key variables are `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `GROK_API_KEY`,
+  and `DEEPSEEK_API_KEY`. Model variables are `OPENROUTER_MODEL`,
+  `OPENAI_MODEL`, `GROK_MODEL`, and `DEEPSEEK_MODEL`. Keep credentials in
+  Replit Secrets or another secure environment store, not in source files.
+- Missing keys or model names skip that provider. Timeouts, connection errors,
+  rate limits, server errors, invalid responses, and configuration failures
+  move to the next provider. There is one bounded request attempt per provider.
+- If all providers fail, the coordinator returns a structured unavailable
+  result and the standalone Python CLIs remain usable.
+- The model receives bounded results for interpretation. Tool outputs are
+  treated as the factual source; AI statements are returned separately.
 
 ### Out of scope or not established
 
@@ -211,26 +237,25 @@ or contact external services. The current imported checkout is shallow and
 does not expose the report's cited `f940c12` commit; see the Git provenance
 note above.
 
-## 7. AI coordinator design for Stage 2
+## 7. AI coordinator behavior
 
-The planned coordinator is a separate optional layer. It should:
+The coordinator is an optional layer over the existing Python tools. It:
 
-- Use one GE Nexus coordinator to replace Claude's role in request
+- Uses one GE Nexus coordinator to handle request
   interpretation, tool selection, workflow coordination, and result
   explanation.
-- Use the intended provider priority OpenRouter -> OpenAI -> Grok/xAI ->
-  DeepSeek, with bounded timeouts, limited retries, and clear error reporting.
-- Fall back on provider failures, rate limits, or timeouts without endless
-  retries. Multiple providers are planned, not implemented.
-- Read credentials from runtime environment variables backed by Replit
+- Uses the provider priority OpenRouter -> OpenAI -> Grok/xAI -> DeepSeek, with
+  bounded timeouts and one attempt per provider before moving to the next.
+- Falls back on provider failures, rate limits, invalid responses, or timeouts.
+- Reads credentials from runtime environment variables backed by Replit
   Secrets. Never hardcode, print, log, expose, or include secret values in
   diagnostic prompts.
-- Use a restricted allowlist of existing Python commands and validate
+- Uses a restricted allowlist of existing Python commands and validates
   symbols, arguments, results, and failures before presenting them.
-- Pass structured tool results to the model for explanation. Python outputs
+- Passes structured tool results to the model for explanation. Python outputs
   remain the source of truth for prices, signals, plans, sizing, and risk.
-- Keep broker actions and external connectors outside the initial coordinator.
-- Leave the CLI analysis engine usable when all providers are missing,
+- Keeps broker actions and external connectors outside the coordinator.
+- Leaves the CLI analysis engine usable when all providers are missing,
   invalid, exhausted, or unavailable.
 
 Without a working provider, AI-driven natural-language coordination and
@@ -243,9 +268,9 @@ experience works without a model.
 The intended order of work is:
 
 1. Preserve the CLI and deterministic Python engine.
-2. Implement and verify optional AI coordination and provider fallback.
-3. Verify missing-credential behavior, provider failures, offline operation,
-   and structured outputs.
+2. Implement and offline-test optional AI coordination and provider fallback.
+3. Verify actual provider configuration with user-selected model identifiers
+   and credentials, without exposing secrets.
 4. Assess deployment on a suitable Python hosting environment.
 5. Consider a user interface only in a later, separately approved stage.
 
@@ -298,14 +323,12 @@ verified while preparing this guide.
 - Stage 1 foundation and branding are complete.
 - The Python tools remain the core analysis engine and do not require AI
   credentials.
-- This guide was already present in the imported checkout and has been updated
-  against the current repository snapshot. No source code, strategies, or
-  runtime configuration were changed for this documentation update.
-- Stage 2 provider integration and tool coordination have not started.
-- The next intended milestone is an optional AI coordinator with the planned
-  provider fallback, preserving the Python-only tools.
-- A later verification stage should test the implementation and assess
-  deployment readiness.
+- Stage 2 coordinator and provider fallback are implemented and offline-tested.
+- Provider model names must be supplied as environment variables; live provider
+  requests, market-data requests, broker activity, and deployment were not
+  tested.
+- The next milestone is a controlled provider configuration check, followed by
+  a separate deployment assessment.
 
 ## 12. Milestone log
 
@@ -313,5 +336,5 @@ verified while preparing this guide.
 |---|---|---|---|
 | Stage 1 - historical | GE Nexus identity, core-only README guide, plugin descriptions, and repository checks, as reported in the Stage 1 completion report. | The report records 315 passing unit tests and `git diff --check`; no live-data or broker operation was performed. Broker-flow tests use synthetic local placement/fill state. Results were not rerun for this guide update. | Continue preserving core interfaces; implement the optional AI coordinator only as a separately approved milestone. |
 | Handoff guide - reviewed 2026-10-29 | The guide was already present in the imported snapshot; its status, Git provenance, and conditional price-file handoff were reconciled with the current files. | Documentation-only change; `git diff --check` passed. No unit tests, live-data requests, provider calls, or broker operations were run. | Keep this guide current after future development stages. |
-| Stage 2 - pending | Nothing implemented. | Not run. | Add optional AI coordination and provider fallback while keeping the deterministic Python engine independent. |
-| Deployment assessment - future | Nothing implemented or verified. | Not run. | Assess hosting only after AI coordination and offline/failure behavior are verified. |
+| Stage 2 - optional AI coordinator | `trader-ai/provider.py` and `trader-ai/coordinator.py` provide ordered OpenRouter, OpenAI, Grok, and DeepSeek fallback; strict plan validation; bounded allowlisted CLI execution; and structured interpretation. `README.md` and this guide document invocation, configuration, and limits. `tests/test_ai_provider.py` and `tests/test_ai_coordinator.py` cover offline behavior. No strategy logic or broker utilities were changed. | Focused AI suite: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_ai_*.py' -v`, 44 passed. Broader offline suite discovered 359 tests, excluded all 18 `tests/test_broker.py` cases to avoid running ticket placement/fill state flows, and passed the remaining 341. All 11 coordinator CLI mappings parsed via `--help`. The repository checks passed: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_repo.py' -v` (11 passed) and `git diff --check`. No provider requests, live market-data requests, or broker operations were performed. | Test chosen model identifiers and provider credentials in a controlled provider check. Then assess deployment separately; no production readiness is claimed. |
+| Deployment assessment - future | Nothing implemented or verified. | Not run. | Assess hosting after provider configuration and operational limits are separately verified. |
