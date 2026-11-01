@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import sys
@@ -36,6 +37,35 @@ class WebAppTests(unittest.TestCase):
         self.assertFalse(response.json["provider_checks_are_live"])
         self.assertFalse(response.json["analysis_history"]["persistent"])
         self.assertNotIn(secret, json.dumps(response.json))
+
+    def test_render_requires_an_access_password(self):
+        with self.assertRaisesRegex(RuntimeError, "GE_NEXUS_ACCESS_PASSWORD"):
+            webapp._validate_deployment_configuration({"RENDER": "true"})
+        webapp._validate_deployment_configuration(
+            {"RENDER": "true", "GE_NEXUS_ACCESS_PASSWORD": "configured"}
+        )
+
+    def test_configured_password_protects_app_but_not_health_check(self):
+        password = "test-only-access-password"
+        basic = base64.b64encode(
+            ("ge-nexus:" + password).encode("utf-8")
+        ).decode("ascii")
+        with mock.patch.dict(os.environ, {"GE_NEXUS_ACCESS_PASSWORD": password}):
+            page = self.client.get("/")
+            status = self.client.get("/api/status")
+            health = self.client.get("/api/health")
+            authorized_page = self.client.get(
+                "/", headers={"Authorization": "Basic " + basic}
+            )
+            authorized_status = self.client.get(
+                "/api/status", headers={"Authorization": "Basic " + basic}
+            )
+        self.assertEqual(page.status_code, 401)
+        self.assertIn("Basic", page.headers["WWW-Authenticate"])
+        self.assertEqual(status.status_code, 401)
+        self.assertEqual(health.status_code, 200)
+        self.assertEqual(authorized_page.status_code, 200)
+        self.assertEqual(authorized_status.status_code, 200)
 
     def test_scanner_route_uses_existing_validated_action_without_ai(self):
         expected = {

@@ -5,6 +5,7 @@ chooses scripts, arguments, providers, or filesystem paths.
 """
 
 import json
+import hmac
 import math
 import os
 import re
@@ -34,6 +35,19 @@ ANALYSIS_WINDOW_SECONDS = 15 * 60
 MAX_SCANS_PER_WINDOW = 12
 SCAN_WINDOW_SECONDS = 60
 TICKER_RE = re.compile(r"^[A-Z][A-Z0-9]{0,4}(?:[.-][A-Z])?$")
+ACCESS_PASSWORD_ENV = "GE_NEXUS_ACCESS_PASSWORD"
+
+
+def _validate_deployment_configuration(environ):
+    if environ.get("RENDER", "").lower() == "true" and not environ.get(
+        ACCESS_PASSWORD_ENV, ""
+    ).strip():
+        raise RuntimeError(
+            "Set GE_NEXUS_ACCESS_PASSWORD in Render before starting GE Nexus."
+        )
+
+
+_validate_deployment_configuration(os.environ)
 
 app = Flask(__name__, static_folder=str(WEB_DIR), static_url_path="/assets")
 app.config["MAX_CONTENT_LENGTH"] = MAX_BODY_BYTES
@@ -59,6 +73,30 @@ class SlidingWindowLimiter:
 
 
 _limiter = SlidingWindowLimiter()
+
+
+@app.before_request
+def require_deployment_password():
+    password = os.environ.get(ACCESS_PASSWORD_ENV, "").strip()
+    if not password or request.path == "/api/health":
+        return None
+
+    authorization = request.authorization
+    if (
+        authorization is not None
+        and authorization.type.lower() == "basic"
+        and hmac.compare_digest(authorization.username or "", "ge-nexus")
+        and hmac.compare_digest(authorization.password or "", password)
+    ):
+        return None
+
+    response = app.response_class(
+        "GE Nexus requires HTTP Basic authentication.",
+        status=401,
+        mimetype="text/plain",
+    )
+    response.headers["WWW-Authenticate"] = 'Basic realm="GE Nexus", charset="UTF-8"'
+    return response
 
 
 def _api_error(category, message, status):
