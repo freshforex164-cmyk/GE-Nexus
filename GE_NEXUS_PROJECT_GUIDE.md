@@ -21,8 +21,11 @@ investigation.
 - **Implemented and offline-tested:** the optional GE Nexus coordinator and
   ordered provider adapter. No provider or live market-data calls were made
   during Stage 2 verification.
-- **Known limits:** public data can be delayed or unavailable; this repository
-  is not a web application or a complete trading service.
+- **PWA integration in progress:** a Flask API and static PWA are being added
+  over the existing tools. Their verification and limitations will be recorded
+  in the Stage 3 milestone below.
+- **Known limits:** public data can be delayed or unavailable; GE Nexus is not
+  a complete trading service or brokerage integration.
 
 The runtime `trader/` data directory is not present in the checked-in project
 snapshot. Tools create or use those files when run.
@@ -81,6 +84,8 @@ files are discarded when that run ends.
 ### Implemented
 
 - An existing Python CLI toolkit for stock research and trade planning.
+- A responsive PWA over the same Python engine, with Dashboard, Market Scanner,
+  AI Analyst, Analysis & Risk, and Activity & Settings sections.
 - Core analysis that does not import or require Claude, Anthropic, OpenRouter,
   OpenAI, Grok/xAI, DeepSeek, or another AI provider.
 - Deterministic calculations for detected setups, trigger status, entry/exit
@@ -129,8 +134,8 @@ files are discarded when that run ends.
 - GE Nexus is not a broker or brokerage account. A proposed signal, plan, or
   order ticket is not evidence that an order was placed or executed.
 - Broker execution is outside the initial AI-coordinator scope.
-- This is not a complete web application or guaranteed live-market-data
-  service.
+- The PWA is a research surface, not a complete trading service, guaranteed
+  live-market-data service, or brokerage/account-management product.
 - Forex is not a complete supported feature in this stock-oriented toolkit.
 - Delayed, stale, missing, simulated, or unavailable data must never be
   described as live and verified.
@@ -161,10 +166,11 @@ calculations or become a required dependency.
 
 ## 5. Original architecture and data flow
 
-The repository contains Python scripts, skill instructions, example
-configuration, and offline fixtures. It has no AI-provider client or central
-Python process that calls the other scripts. Public-data requests are made by
-the relevant data tool, not by an AI client.
+The original toolkit consists of Python scripts, skill instructions, example
+configuration, and offline fixtures. Stage 2 added an optional AI-provider
+client and coordinator; Stage 3 adds a Flask web API and static PWA over those
+same scripts. Public-data requests are made by the relevant data tool, not by
+an AI client.
 
 Typical file handoffs are:
 
@@ -269,13 +275,14 @@ The intended order of work is:
 
 1. Preserve the CLI and deterministic Python engine.
 2. Implement and offline-test optional AI coordination and provider fallback.
-3. Verify actual provider configuration with user-selected model identifiers
+3. Integrate a PWA through a restricted same-origin API over the existing tools.
+4. Verify actual provider configuration with user-selected model identifiers
    and credentials, without exposing secrets.
-4. Assess deployment on a suitable Python hosting environment.
-5. Consider a user interface only in a later, separately approved stage.
+5. Put access control in place before exposing provider-backed requests publicly.
+6. Assess and verify deployment on a suitable Python hosting environment.
 
-No web application, live service, deployment, or production environment was
-verified while preparing this guide.
+No public deployment or production environment has been verified. A development
+workflow is not evidence of a public deployment or production readiness.
 
 ## 9. Known limitations and risks
 
@@ -324,11 +331,12 @@ verified while preparing this guide.
 - The Python tools remain the core analysis engine and do not require AI
   credentials.
 - Stage 2 coordinator and provider fallback are implemented and offline-tested.
-- Provider model names must be supplied as environment variables; live provider
-  requests, market-data requests, broker activity, and deployment were not
-  tested.
-- The next milestone is a controlled provider configuration check, followed by
-  a separate deployment assessment.
+- Stage 3 adds the web interface and API; its tests, start command, limitations,
+  and deployment status are recorded in the milestone log.
+- Provider model names must be supplied as environment variables. Live provider
+  requests, broker activity, and deployment remain unverified.
+- Before public deployment, configure access control and perform a controlled
+  provider check, then assess deployment separately.
 
 ## 12. Milestone log
 

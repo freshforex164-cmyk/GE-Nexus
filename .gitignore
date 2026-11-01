@@ -6,3 +6,7 @@
 # Generated Python bytecode
 __pycache__/
 *.py[cod]
+
+# Replit package environment and package-manager metadata
+.pythonlibs/
+.upm/

@@ -1,6 +1,9 @@
 # GE Nexus
 
-GE Nexus is a Python stock-analysis toolkit with eleven existing Claude skill instructions. Its core command-line tools calculate scans, entry and exit plans, simulations, position sizes, and risk checks without an AI API key.
+GE Nexus is a Python stock-analysis toolkit with eleven existing Claude skill
+instructions and an optional browser-based PWA. Its core command-line tools
+calculate scans, entry and exit plans, simulations, position sizes, and risk
+checks without an AI API key.
 
 The repository also includes an optional AI coordinator for those existing
 Python tools.
@@ -9,10 +12,9 @@ The tools are plain Python that read public data from Yahoo Finance charts,
 Nasdaq Trader's symbol lists, SEC EDGAR and the House Clerk. Core analysis does
 not call an AI provider.
 
-The repository remains a collection of Python command-line tools, with an
-optional AI coordinator, not a web application or a complete trading service.
-The scripts produce analysis and structured files; they do not replace a
-user's review or guarantee a trade outcome.
+The PWA is a research interface over the existing Python tools, not a complete
+trading service. The scripts produce analysis and structured files; they do
+not replace a user's review or guarantee a trade outcome.
 
 The Python tools and AI coordinator do not submit orders. The existing broker
 skill can prepare a ticket for a separately configured broker connector,
@@ -108,6 +110,47 @@ If all providers are unavailable, the coordinator reports that AI assistance
 is unavailable; the existing Python commands continue to work without AI
 credentials. The provider request and tool execution are bounded, and model
 output cannot select arbitrary commands, code, or broker actions.
+
+## Web app and PWA
+
+GE Nexus includes a responsive PWA served by the same Python process as its
+backend. It has five sections: Dashboard, Market Scanner, AI Analyst, Analysis
+& Risk, and Activity & Settings. Scans call the existing Python scanner.
+Natural-language requests use `trader-ai/coordinator.py` through the same
+validated coordinator interface as the command line.
+
+The web app does not create sample balances, holdings, recent analyses, or
+brokerage activity. It shows saved scanner results only when a real
+`trader/watchlist.json` exists. Analysis history is not persisted. Provider
+settings show whether the key and model variables are configured, not whether
+the provider is reachable; the successful provider is shown only when an
+analysis request returns one.
+
+The app shell and static assets can load from the service worker while offline.
+API responses are never cached. Scans, AI requests, and exchange status need a
+network connection. No API keys are sent to the browser.
+
+### Run the web app
+
+The existing command-line tools remain independently usable. To install the
+small web dependencies and start the combined frontend/backend locally:
+
+```bash
+python3 -m pip install -r requirements.txt
+gunicorn --chdir trader-ai --bind 0.0.0.0:5000 --workers 1 --threads 4 --timeout 135 webapp:app
+```
+
+The Replit web workflow uses the same Gunicorn command on port 5000. The web
+runtime uses Python 3.12 in this workspace. The standalone analysis tools do
+not require Flask or Gunicorn.
+
+Provider credentials must be set through Replit Secrets or another secure
+environment store. Configure each provider's API key and model variable as
+described above. The provider priority remains OpenRouter, OpenAI, Grok, then
+DeepSeek. The API includes basic per-process request limits, but the app does
+not include user authentication. Keep it owner-only until an access-control
+policy is configured before any public deployment. Deployment itself has not
+been performed or verified.
 
 ## The eleven
 
