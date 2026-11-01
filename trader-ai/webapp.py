@@ -81,21 +81,21 @@ def require_deployment_password():
     if not password or request.path == "/api/health":
         return None
 
-    authorization = request.authorization
-    if (
-        authorization is not None
-        and authorization.type.lower() == "basic"
-        and hmac.compare_digest(authorization.username or "", "ge-nexus")
-        and hmac.compare_digest(authorization.password or "", password)
-    ):
-        return None
+   # authorization = request.authorization
+    #if (
+       # authorization is not None
+       # and authorization.type.lower() == "basic"
+       # and hmac.compare_digest(authorization.username or "", "ge-nexus")
+       # and hmac.compare_digest(authorization.password or "", password)
+  #  ):
+       # return None
 
-    response = app.response_class(
-        "GE Nexus requires HTTP Basic authentication.",
-        status=401,
-        mimetype="text/plain",
-    )
-    response.headers["WWW-Authenticate"] = 'Basic realm="GE Nexus", charset="UTF-8"'
+   # response = app.response_class(
+       # "GE Nexus requires HTTP Basic authentication.",
+       # status=401,
+      #  mimetype="text/plain",
+   # )
+   # response.headers["WWW-Authenticate"] = 'Basic realm="GE Nexus", charset="UTF-8"'
     return response
 
 
