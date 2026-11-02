@@ -1,4 +1,4 @@
-"""GE Nexus web API and PWA shell.
+I'm"""GE Nexus web API and PWA shell.
 
 The browser can request only the named analysis endpoints below. It never
 chooses scripts, arguments, providers, or filesystem paths.
@@ -75,11 +75,11 @@ class SlidingWindowLimiter:
 _limiter = SlidingWindowLimiter()
 
 
-@app.before_request
-def require_deployment_password():
-    password = os.environ.get(ACCESS_PASSWORD_ENV, "").strip()
-    if not password or request.path == "/api/health":
-        return None
+#@app.before_request
+#def require_deployment_password():
+    #password = os.environ.get(ACCESS_PASSWORD_ENV, "").strip()
+    #if not password or request.path == "/api/health":
+        #return None
 
    # authorization = request.authorization
     #if (
@@ -96,7 +96,7 @@ def require_deployment_password():
       #  mimetype="text/plain",
    # )
    # response.headers["WWW-Authenticate"] = 'Basic realm="GE Nexus", charset="UTF-8"'
-    return response
+    #return response
 
 
 def _api_error(category, message, status):
