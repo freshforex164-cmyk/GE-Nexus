@@ -1,4 +1,4 @@
-I'm"""GE Nexus web API and PWA shell.
+"""GE Nexus web API and PWA shell.
 
 The browser can request only the named analysis endpoints below. It never
 chooses scripts, arguments, providers, or filesystem paths.
