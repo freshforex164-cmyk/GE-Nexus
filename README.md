@@ -114,21 +114,33 @@ output cannot select arbitrary commands, code, or broker actions.
 ## Web app and PWA
 
 GE Nexus includes a responsive PWA served by the same Python process as its
-backend. It has five sections: Dashboard, Market Scanner, AI Analyst, Analysis
-& Risk, and Activity & Settings. Scans call the existing Python scanner.
-Natural-language requests use `trader-ai/coordinator.py` through the same
-validated coordinator interface as the command line.
+backend, with three sections: Home, Analysis, and Settings. Home runs the
+existing daily-close or opening-range scanner across a default set of seven
+U.S.-listed equity tickers. The list can be edited in Settings and is saved in
+that browser only; up to 20 symbols can be scanned per request. The scanner
+also accepts manually selected symbols.
 
-The web app does not create sample balances, holdings, recent analyses, or
-brokerage activity. It shows saved scanner results only when a real
-`trader/watchlist.json` exists. Analysis history is not persisted. Provider
-settings show whether the key and model variables are configured, not whether
-the provider is reachable; the successful provider is shown only when an
-analysis request returns one.
+Each completed scan or quote is produced by its existing Python tool before
+the optional AI provider interprets the structured result. Without a configured
+provider, the deterministic tool result remains available. Settings can run an
+actual provider connection check; merely configuring a key and model does not
+show a provider as connected. No free-text AI request form is part of the PWA.
+
+The existing scanner universe builder supports U.S.-listed common stocks,
+ordinary shares, and ADRs using Nasdaq Trader symbol directories. The scanner
+uses Yahoo Finance chart data. Forex, commodities, crypto, and other non-equity
+assets are not supported by this scanner. A ticker's presence in the editable
+list does not guarantee that Yahoo returns data for it.
+
+The web app does not create sample balances, holdings, analyses, or brokerage
+activity. Results are held in the current page session, not persisted as
+analysis history. A risk check is available only when saved proposed orders and
+risk limits are present, and it does not submit orders.
 
 The app shell and static assets can load from the service worker while offline.
-API responses are never cached. Scans, AI requests, and exchange status need a
-network connection. No API keys are sent to the browser.
+API responses are never cached. Scans, AI interpretation and provider checks,
+and exchange status need a network connection. No API keys are sent to the
+browser.
 
 ### Run the web app
 
@@ -144,13 +156,13 @@ The Replit web workflow uses the same Gunicorn command on port 5000. The web
 runtime uses Python 3.12 in this workspace. The standalone analysis tools do
 not require Flask or Gunicorn.
 
-Provider credentials must be set through Replit Secrets or another secure
-environment store. Configure each provider's API key and model variable as
-described above. The provider priority remains OpenRouter, OpenAI, Grok, then
-DeepSeek. The API includes basic per-process request limits, but the app does
-not include user authentication. Keep it owner-only until an access-control
-policy is configured before any public deployment. Deployment itself has not
-been performed or verified.
+Provider credentials must be set through Replit Secrets, Render environment
+variables, or another secure environment store. Configure each provider's API
+key and model variable as described above. The provider priority remains
+OpenRouter, OpenAI, Grok, then DeepSeek. On Render, set
+`GE_NEXUS_ACCESS_PASSWORD`; the app and API require HTTP Basic authentication
+with username `ge-nexus` and that password. The health endpoint remains public
+for service checks. Request limits are best-effort per process.
 
 ## The eleven
 

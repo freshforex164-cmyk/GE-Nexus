@@ -29,7 +29,8 @@ import coordinator  # noqa: E402
 
 
 MAX_BODY_BYTES = 16 * 1024
-MAX_SYMBOLS = 12
+MAX_SYMBOLS = 20
+DEFAULT_SCAN_SYMBOLS = ("AAPL", "AMZN", "GOOGL", "META", "MSFT", "NVDA", "TSLA")
 MAX_REQUESTS_PER_WINDOW = 5
 ANALYSIS_WINDOW_SECONDS = 15 * 60
 MAX_SCANS_PER_WINDOW = 12
@@ -75,28 +76,28 @@ class SlidingWindowLimiter:
 _limiter = SlidingWindowLimiter()
 
 
-#@app.before_request
-#def require_deployment_password():
-    #password = os.environ.get(ACCESS_PASSWORD_ENV, "").strip()
-    #if not password or request.path == "/api/health":
-        #return None
+@app.before_request
+def require_deployment_password():
+    password = os.environ.get(ACCESS_PASSWORD_ENV, "").strip()
+    if not password or request.path == "/api/health":
+        return None
 
-   # authorization = request.authorization
-    #if (
-       # authorization is not None
-       # and authorization.type.lower() == "basic"
-       # and hmac.compare_digest(authorization.username or "", "ge-nexus")
-       # and hmac.compare_digest(authorization.password or "", password)
-  #  ):
-       # return None
+    authorization = request.authorization
+    if (
+        authorization is not None
+        and authorization.type.lower() == "basic"
+        and hmac.compare_digest(authorization.username or "", "ge-nexus")
+        and hmac.compare_digest(authorization.password or "", password)
+    ):
+        return None
 
-   # response = app.response_class(
-       # "GE Nexus requires HTTP Basic authentication.",
-       # status=401,
-      #  mimetype="text/plain",
-   # )
-   # response.headers["WWW-Authenticate"] = 'Basic realm="GE Nexus", charset="UTF-8"'
-    #return response
+    response = app.response_class(
+        "GE Nexus requires HTTP Basic authentication.",
+        status=401,
+        mimetype="text/plain",
+    )
+    response.headers["WWW-Authenticate"] = 'Basic realm="GE Nexus", charset="UTF-8"'
+    return response
 
 
 def _api_error(category, message, status):
@@ -199,6 +200,11 @@ def _provider_status():
             {
                 "name": spec.name,
                 "priority": priority,
+                "key_env": spec.key_env,
+                "model_env": spec.model_env,
+                "endpoint_env": spec.endpoint_env,
+                "key_configured": has_key,
+                "model_configured": has_model,
                 "configured": configured,
                 "connection_verified": False,
                 "state": (
@@ -211,6 +217,19 @@ def _provider_status():
             }
         )
     return providers
+
+
+def _has_regular_runtime_file(name):
+    path = ROOT / "trader" / name
+    try:
+        info = path.lstat()
+        return (
+            not path.is_symlink()
+            and path.is_file()
+            and info.st_size <= coordinator.RUNTIME_FILE_LIMIT
+        )
+    except OSError:
+        return False
 
 
 def _execute_validated_action(tool, arguments, request_text):
@@ -233,6 +252,32 @@ def _execute_validated_action(tool, arguments, request_text):
         plan, time.monotonic() + coordinator.MAX_TOTAL_SECONDS
     )
     return results[0], warnings
+
+
+def _interpret_action(result, request_text):
+    plan = {"intent": request_text}
+    interpretation, error, interpretation_provider = coordinator._interpret(
+        request_text,
+        plan,
+        [result],
+        time.monotonic() + coordinator.MAX_TOTAL_SECONDS,
+    )
+    result["interpretation"] = interpretation
+    result["interpretation_provider"] = interpretation_provider
+    if error:
+        result["interpretation_error"] = error
+    result["ai_status"] = "complete" if interpretation else "unavailable"
+    return result
+
+
+def _single_symbol(body):
+    symbol = body.get("symbol")
+    if not isinstance(symbol, str):
+        return None, _api_error("invalid_symbol", "Enter one valid ticker symbol.", 400)
+    symbol = symbol.strip().upper()
+    if not TICKER_RE.fullmatch(symbol):
+        return None, _api_error("invalid_symbol", "Enter one valid ticker symbol.", 400)
+    return symbol, None
 
 
 @app.before_request
@@ -330,12 +375,39 @@ def status():
             },
             "providers": _provider_status(),
             "provider_checks_are_live": False,
+            "risk_inputs_available": (
+                _has_regular_runtime_file("orders.json")
+                and _has_regular_runtime_file("config.json")
+            ),
             "watchlist": _watchlist_summary(),
             "analysis_history": {"available": False, "persistent": False},
             "capabilities": {
                 "natural_language_coordination": True,
                 "market_scanner": True,
                 "broker_execution": False,
+            },
+        }
+    )
+
+
+@app.get("/api/universe")
+def scan_universe():
+    return jsonify(
+        {
+            "default_symbols": list(DEFAULT_SCAN_SYMBOLS),
+            "max_symbols": MAX_SYMBOLS,
+            "market": {
+                "supported": [
+                    "U.S.-listed common stocks",
+                    "ordinary shares",
+                    "ADRs",
+                ],
+                "unsupported": ["forex", "commodities", "crypto", "other non-equity assets"],
+                "universe_source": (
+                    "Nasdaq Trader symbol directories, filtered by the existing "
+                    "scanner's U.S.-listed equity rules"
+                ),
+                "price_data_source": "Yahoo Finance chart data",
             },
         }
     )
@@ -394,7 +466,7 @@ def scan():
     if error:
         return error
     mode = body.get("mode")
-    symbols = body.get("symbols")
+    symbols = body.get("symbols", list(DEFAULT_SCAN_SYMBOLS))
     if mode not in ("daily", "orb"):
         return _api_error("invalid_mode", "Choose daily or opening-range scan.", 400)
     if (
@@ -434,10 +506,139 @@ def scan():
     result, warnings = _execute_validated_action(
         tool, {"symbols": normalized}, request_text
     )
+    result["requested_symbols"] = normalized
+    if result.get("status") == "completed":
+        result = _interpret_action(result, request_text)
     if warnings:
         result["runtime_input_warnings"] = warnings
     status_code = 200 if result.get("status") == "completed" else 502
     return jsonify(result), status_code
+
+
+@app.post("/api/instrument")
+def analyze_instrument():
+    body, error = _json_body()
+    if error:
+        return error
+    symbol, error = _single_symbol(body)
+    if error:
+        return error
+    allowed, retry_after = _limiter.allow(
+        ("scanner", _remote_key()), MAX_SCANS_PER_WINDOW, SCAN_WINDOW_SECONDS
+    )
+    if not allowed:
+        response = jsonify(
+            {
+                "error": {
+                    "category": "rate_limited",
+                    "message": "Too many market requests. Wait before trying again.",
+                }
+            }
+        )
+        response.status_code = 429
+        response.headers["Retry-After"] = str(retry_after)
+        return response
+
+    request_text = "Analyze the available quote data for " + symbol
+    result, warnings = _execute_validated_action(
+        "alerts_quote", {"symbols": [symbol]}, request_text
+    )
+    result["symbol"] = symbol
+    if result.get("status") == "completed":
+        result = _interpret_action(result, request_text)
+    if warnings:
+        result["runtime_input_warnings"] = warnings
+    status_code = 200 if result.get("status") == "completed" else 502
+    return jsonify(result), status_code
+
+
+@app.post("/api/risk")
+def check_risk():
+    body, error = _json_body()
+    if error:
+        return error
+    if body:
+        return _api_error("invalid_request", "This check uses the saved order and risk files.", 400)
+    if not (
+        _has_regular_runtime_file("orders.json")
+        and _has_regular_runtime_file("config.json")
+    ):
+        return _api_error(
+            "risk_inputs_missing",
+            "Add proposed orders and risk limits before running a risk check.",
+            409,
+        )
+
+    request_text = "Check the configured proposed orders against the saved risk limits"
+    result, warnings = _execute_validated_action("risk_check", {}, request_text)
+    if result.get("status") == "completed":
+        result = _interpret_action(result, request_text)
+    if warnings:
+        result["runtime_input_warnings"] = warnings
+    status_code = 200 if result.get("status") == "completed" else 502
+    return jsonify(result), status_code
+
+
+@app.post("/api/providers/check")
+def check_provider_connection():
+    body, error = _json_body()
+    if error:
+        return error
+    if body:
+        return _api_error("invalid_request", "This connection check does not accept options.", 400)
+    allowed, retry_after = _limiter.allow(
+        ("provider_check", _remote_key()),
+        MAX_REQUESTS_PER_WINDOW,
+        ANALYSIS_WINDOW_SECONDS,
+    )
+    if not allowed:
+        response = jsonify(
+            {
+                "error": {
+                    "category": "rate_limited",
+                    "message": "Too many connection checks. Wait before trying again.",
+                }
+            }
+        )
+        response.status_code = 429
+        response.headers["Retry-After"] = str(retry_after)
+        return response
+
+    try:
+        result = coordinator.provider.chat_completion(
+            [
+                {
+                    "role": "system",
+                    "content": "Reply with the single word OK.",
+                },
+                {
+                    "role": "user",
+                    "content": "GE Nexus connection check. Reply OK.",
+                },
+            ],
+            deadline=time.monotonic() + coordinator.MAX_TOTAL_SECONDS,
+        )
+    except coordinator.provider.ProviderUnavailable as exc:
+        return (
+            jsonify(
+                {
+                    "verified": False,
+                    "message": (
+                        "No configured AI provider completed the connection check. "
+                        "Review the required key and model settings."
+                    ),
+                    "attempts": exc.attempts,
+                }
+            ),
+            503,
+        )
+    return jsonify(
+        {
+            "verified": True,
+            "provider": result["provider"],
+            "model": result["model"],
+        }
+    )
 
 
 if __name__ == "__main__":

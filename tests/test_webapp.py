@@ -33,6 +33,8 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.json["engine"]["available"])
         self.assertTrue(response.json["providers"][1]["configured"])
+        self.assertTrue(response.json["providers"][1]["key_configured"])
+        self.assertTrue(response.json["providers"][1]["model_configured"])
         self.assertFalse(response.json["providers"][1]["connection_verified"])
         self.assertFalse(response.json["provider_checks_are_live"])
         self.assertFalse(response.json["analysis_history"]["persistent"])
@@ -67,7 +69,7 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(authorized_page.status_code, 200)
         self.assertEqual(authorized_status.status_code, 200)
 
-    def test_scanner_route_uses_existing_validated_action_without_ai(self):
+    def test_scanner_route_uses_existing_validated_action_and_preserves_results(self):
         expected = {
             "id": "a1",
             "tool": "scanner_daily",
@@ -80,19 +82,85 @@ class WebAppTests(unittest.TestCase):
         }
         with mock.patch.object(
             webapp.coordinator, "_run_actions", return_value=([expected], [])
-        ) as run:
+        ) as run, mock.patch.object(
+            webapp, "_interpret_action", side_effect=lambda result, _text: result
+        ) as interpret:
             response = self.client.post(
                 "/api/scanner",
                 json={"mode": "daily", "symbols": ["aapl"]},
             )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json["data"]["hits"][0]["symbol"], "AAPL")
+        self.assertEqual(response.json["requested_symbols"], ["AAPL"])
+        interpret.assert_called_once()
         plan = run.call_args.args[0]
         self.assertEqual(plan["actions"][0]["tool"], "scanner_daily")
         self.assertEqual(plan["actions"][0]["arguments"]["symbols"], ["AAPL"])
 
+    def test_scanner_uses_default_universe_and_exposes_supported_assets(self):
+        response = self.client.get("/api/universe")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["default_symbols"], list(webapp.DEFAULT_SCAN_SYMBOLS))
+        self.assertEqual(response.json["max_symbols"], 20)
+        self.assertIn("U.S.-listed common stocks", response.json["market"]["supported"])
+        self.assertIn("forex", response.json["market"]["unsupported"])
+        self.assertNotIn("NASDAQ", response.json["default_symbols"])
+
+        expected = {
+            "id": "a1",
+            "tool": "scanner_daily",
+            "status": "completed",
+            "data": {"created_by": "trader-scanner", "mode": "daily", "hits": []},
+        }
+        with mock.patch.object(
+            webapp, "_execute_validated_action", return_value=(expected, [])
+        ) as execute, mock.patch.object(
+            webapp, "_interpret_action", side_effect=lambda result, _text: result
+        ):
+            scan = self.client.post("/api/scanner", json={"mode": "daily"})
+        self.assertEqual(scan.status_code, 200)
+        self.assertEqual(scan.json["requested_symbols"], list(webapp.DEFAULT_SCAN_SYMBOLS))
+        self.assertEqual(
+            execute.call_args.args[1]["symbols"], list(webapp.DEFAULT_SCAN_SYMBOLS)
+        )
+
+    def test_scanner_auto_interprets_only_completed_tool_results(self):
+        successful = {
+            "id": "a1", "tool": "scanner_daily", "status": "completed",
+            "data": {"created_by": "trader-scanner", "mode": "daily", "hits": []},
+        }
+        failed = {"id": "a1", "tool": "scanner_daily", "status": "failed"}
+        interpretation = {
+            "summary": "No matching setups.",
+            "reported_facts": [],
+            "interpretation": "No scan candidates were returned.",
+            "limitations": [],
+        }
+        with mock.patch.object(
+            webapp, "_execute_validated_action", return_value=(successful.copy(), [])
+        ), mock.patch.object(
+            webapp.coordinator, "_interpret",
+            return_value=(interpretation, None, "OpenAI"),
+        ) as interpret:
+            response = self.client.post(
+                "/api/scanner", json={"mode": "daily", "symbols": ["AAPL"]}
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["interpretation"], interpretation)
+        self.assertEqual(response.json["interpretation_provider"], "OpenAI")
+        interpret.assert_called_once()
+
+        with mock.patch.object(
+            webapp, "_execute_validated_action", return_value=(failed, [])
+        ), mock.patch.object(webapp, "_interpret_action") as interpret_failed:
+            response = self.client.post(
+                "/api/scanner", json={"mode": "daily", "symbols": ["AAPL"]}
+            )
+        self.assertEqual(response.status_code, 502)
+        interpret_failed.assert_not_called()
+
     def test_scanner_rejects_invalid_symbols_and_modes(self):
-        with mock.patch.object(webapp.coordinator, "_run_actions") as run:
+        with mock.patch.object(webapp, "_execute_validated_action") as run:
             invalid_symbol = self.client.post(
                 "/api/scanner",
                 json={"mode": "daily", "symbols": ["AAPL; echo unsafe"]},
@@ -101,9 +169,78 @@ class WebAppTests(unittest.TestCase):
                 "/api/scanner",
                 json={"mode": "universe", "symbols": ["AAPL"]},
             )
+            too_many = self.client.post(
+                "/api/scanner",
+                json={"mode": "daily", "symbols": ["AAPL"] * 21},
+            )
         self.assertEqual(invalid_symbol.status_code, 400)
         self.assertEqual(invalid_mode.status_code, 400)
+        self.assertEqual(too_many.status_code, 400)
         run.assert_not_called()
+
+    def test_instrument_analysis_uses_existing_quote_tool_and_interpretation(self):
+        quote = {"id": "a1", "tool": "alerts_quote", "status": "completed", "data": "AAPL $1.00"}
+        with mock.patch.object(
+            webapp, "_execute_validated_action", return_value=(quote, [])
+        ) as execute, mock.patch.object(
+            webapp, "_interpret_action", side_effect=lambda result, _text: result
+        ) as interpret:
+            response = self.client.post("/api/instrument", json={"symbol": "aapl"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["symbol"], "AAPL")
+        execute.assert_called_once()
+        self.assertEqual(execute.call_args.args[0], "alerts_quote")
+        interpret.assert_called_once()
+
+    def test_instrument_rejects_exchange_names_and_invalid_tickers(self):
+        with mock.patch.object(webapp, "_execute_validated_action") as execute:
+            response = self.client.post("/api/instrument", json={"symbol": "NASDAQ"})
+        self.assertEqual(response.status_code, 400)
+        execute.assert_not_called()
+
+    def test_risk_route_requires_user_supplied_orders_and_limits(self):
+        with mock.patch.object(webapp, "_has_regular_runtime_file", return_value=False):
+            response = self.client.post("/api/risk", json={})
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json["error"]["category"], "risk_inputs_missing")
+
+        result = {"id": "a1", "tool": "risk_check", "status": "completed", "data": {"passed": 1}}
+        with mock.patch.object(webapp, "_has_regular_runtime_file", return_value=True), \
+             mock.patch.object(
+                 webapp, "_execute_validated_action", return_value=(result, [])
+             ) as execute, mock.patch.object(
+                 webapp, "_interpret_action", side_effect=lambda result, _text: result
+             ):
+            response = self.client.post("/api/risk", json={})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["data"], {"passed": 1})
+        execute.assert_called_once_with(
+            "risk_check", {}, "Check the configured proposed orders against the saved risk limits"
+        )
+
+    def test_provider_check_reports_success_only_after_a_real_completion(self):
+        response_value = {
+            "provider": "OpenRouter", "model": "test-model", "content": "OK"
+        }
+        with mock.patch.object(
+            webapp.coordinator.provider, "chat_completion", return_value=response_value
+        ) as request:
+            response = self.client.post("/api/providers/check", json={})
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json["verified"])
+        self.assertEqual(response.json["provider"], "OpenRouter")
+        request.assert_called_once()
+
+        unavailable = webapp.coordinator.provider.ProviderUnavailable(
+            [{"provider": "OpenRouter", "category": "missing_model"}]
+        )
+        with mock.patch.object(
+            webapp.coordinator.provider, "chat_completion", side_effect=unavailable
+        ):
+            response = self.client.post("/api/providers/check", json={})
+        self.assertEqual(response.status_code, 503)
+        self.assertFalse(response.json["verified"])
+        self.assertIn("model settings", response.json["message"])
 
     def test_analysis_route_calls_real_coordinator_contract(self):
         result = {

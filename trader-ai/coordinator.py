@@ -686,7 +686,12 @@ def _run_one(action, workspace, deadline):
     }
     if stderr:
         result["stderr_preview"] = stderr[:2000]
-    if completed.returncode != 0:
+    scanner_no_match = (
+        action["tool"] in ("scanner_daily", "scanner_orb")
+        and completed.returncode == 1
+    )
+    risk_block = action["tool"] == "risk_check" and completed.returncode == 1
+    if completed.returncode != 0 and not (scanner_no_match or risk_block):
         result["category"] = "tool_exit_nonzero"
         result["stdout_preview"] = redact_sensitive(stdout)[:2000]
         return result
@@ -700,6 +705,23 @@ def _run_one(action, workspace, deadline):
             return result
         if not isinstance(data, dict) or not data:
             result["category"] = "invalid_json_output"
+            result["stdout_preview"] = redact_sensitive(stdout)[:2000]
+            return result
+        if scanner_no_match and not (
+            data.get("created_by") == "trader-scanner"
+            and data.get("mode") == action["tool"].removeprefix("scanner_")
+            and isinstance(data.get("hits"), list)
+            and not data["hits"]
+        ):
+            result["category"] = "tool_exit_nonzero"
+            result["stdout_preview"] = redact_sensitive(stdout)[:2000]
+            return result
+        if risk_block and not (
+            isinstance(data.get("results"), list)
+            and isinstance(data.get("block"), int)
+            and data["block"] > 0
+        ):
+            result["category"] = "tool_exit_nonzero"
             result["stdout_preview"] = redact_sensitive(stdout)[:2000]
             return result
         result["data"] = json.loads(

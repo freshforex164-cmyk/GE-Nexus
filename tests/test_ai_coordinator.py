@@ -239,6 +239,63 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["category"], "invalid_json_output")
 
+    def test_scanner_exit_one_with_valid_empty_result_is_a_completed_scan(self):
+        checked = coordinator.validate_plan(
+            plan([action("scanner_daily", {"symbols": ["TSLA"]})]),
+            "Scan TSLA",
+        )
+        output = json.dumps(
+            {
+                "created_by": "trader-scanner",
+                "mode": "daily",
+                "hits": [],
+                "scanned": 1,
+            }
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            with mock.patch.object(
+                coordinator.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 1, output, ""),
+            ):
+                result = coordinator._run_one(
+                    checked["actions"][0],
+                    coordinator.Path(temp),
+                    coordinator.time.monotonic() + 10,
+                )
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["returncode"], 1)
+        self.assertEqual(result["data"]["hits"], [])
+
+    def test_risk_exit_one_with_blocked_order_preserves_the_verdict(self):
+        checked = coordinator.validate_plan(
+            plan([action("risk_check")]),
+            "Check proposed order risk",
+        )
+        output = json.dumps(
+            {
+                "results": [{"verdict": "BLOCK", "symbol": "TSLA"}],
+                "block": 1,
+                "pass": 0,
+                "warnings": [],
+                "cash_after": 0,
+            }
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            with mock.patch.object(
+                coordinator.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 1, output, ""),
+            ):
+                result = coordinator._run_one(
+                    checked["actions"][0],
+                    coordinator.Path(temp),
+                    coordinator.time.monotonic() + 10,
+                )
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["data"]["block"], 1)
+        self.assertEqual(result["data"]["results"][0]["verdict"], "BLOCK")
+
     def test_timeout_and_too_large_outputs_fail_safely(self):
         checked = coordinator.validate_plan(
             plan([action("alerts_clock")]),
