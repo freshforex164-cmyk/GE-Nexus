@@ -1,6 +1,6 @@
 # GE Nexus Project Guide
 
-Last reviewed: 2026-10-29
+Last reviewed: 2026-11-06
 
 This is the persistent handoff guide for GE Nexus. It records the verified
 repository state, separates implemented behavior from future plans, and gives
@@ -21,9 +21,9 @@ investigation.
 - **Implemented and offline-tested:** the optional GE Nexus coordinator and
   ordered provider adapter. No provider or live market-data calls were made
   during Stage 2 verification.
-- **PWA integration in progress:** a Flask API and static PWA are being added
-  over the existing tools. Their verification and limitations will be recorded
-  in the Stage 3 milestone below.
+- **Implemented and locally verified:** a Flask API and responsive PWA use the
+  existing Python tools. The home, analysis, and settings views run through
+  same-origin routes; details and current limits are recorded below.
 - **Known limits:** public data can be delayed or unavailable; GE Nexus is not
   a complete trading service or brokerage integration.
 
@@ -168,9 +168,42 @@ calculations or become a required dependency.
 
 The original toolkit consists of Python scripts, skill instructions, example
 configuration, and offline fixtures. Stage 2 added an optional AI-provider
-client and coordinator; Stage 3 adds a Flask web API and static PWA over those
+client and coordinator; Stage 3 added a Flask web API and static PWA over those
 same scripts. Public-data requests are made by the relevant data tool, not by
 an AI client.
+
+### Web scanner behavior
+
+- The browser's default list is seven symbols: AAPL, AMZN, GOOGL, META, MSFT,
+  NVDA, and TSLA. It is a convenience preset, not the full scanner universe.
+  Users can edit it in Settings, stored in that browser only. The PWA accepts
+  at most 20 symbols per scan.
+- The CLI can use explicit symbols, a watchlist, or the saved universe
+  generated from Nasdaq Trader directories. That broader universe is not
+  automatically run by the PWA.
+- The scanner reads Yahoo Finance chart data, which is unofficial and may be
+  delayed, rate-limited, incomplete, or missing. Daily scans request three
+  months of daily bars; the current session's daily bar is excluded until its
+  close. Default price and volume filters are $5 and 1,000,000 shares.
+- Daily setups are a 20-day close breakout, bull flag (more than 10% over the
+  prior 10 sessions followed by a five-close range under 5%), 20-day average
+  reclaim, 14-day Wilder RSI below 30, and an oversold bounce.
+- Opening-range scans use 5-minute bars and a 15-minute range beginning at
+  9:30 a.m. New York time. Candidates need a completed bar above the range's
+  highest close; confirmation checks highs and lows in the full chart, requires
+  complete bars through the cutoff, and may leave candidates unconfirmed after
+  the 200-chart confirmation limit.
+- The PWA's automatic mode uses the existing exchange clock. It selects the
+  opening-range scan only after a confirmed session reaches the first eligible
+  completed bar (9:50 a.m. for a 15-minute range) and before the configured
+  cutoff or market close. Otherwise it uses completed daily closes. If the
+  clock is unknown or unavailable, it chooses daily mode rather than forcing
+  an intraday scan.
+- The API adds `scan_summary`, `research_findings`, and
+  `research_explanation` to the existing tool result. Summary states separate
+  completed, partial, no-findings, data-unavailable, and failed runs. Findings
+  contain only scanner-returned values; no entry, stop, target, or reward/risk
+  is inferred.
 
 Typical file handoffs are:
 
@@ -260,6 +293,10 @@ The coordinator is an optional layer over the existing Python tools. It:
   symbols, arguments, results, and failures before presenting them.
 - Passes structured tool results to the model for explanation. Python outputs
   remain the source of truth for prices, signals, plans, sizing, and risk.
+- The PWA connection check sends a server-side request and accepts only the
+  expected `OK` response. Failure summaries contain safe categories, not
+  provider response bodies or keys. Live provider success cannot be claimed
+  until a key and model are configured and the check succeeds.
 - Keeps broker actions and external connectors outside the coordinator.
 - Leaves the CLI analysis engine usable when all providers are missing,
   invalid, exhausted, or unavailable.
@@ -278,11 +315,16 @@ The intended order of work is:
 3. Integrate a PWA through a restricted same-origin API over the existing tools.
 4. Verify actual provider configuration with user-selected model identifiers
    and credentials, without exposing secrets.
-5. Put access control in place before exposing provider-backed requests publicly.
+5. Review the implications of the explicitly public app and its per-process,
+   best-effort request limits before sending real provider traffic.
 6. Assess and verify deployment on a suitable Python hosting environment.
 
-No public deployment or production environment has been verified. A development
-workflow is not evidence of a public deployment or production readiness.
+Authentication is intentionally disabled per the project owner. Keep the app
+and API public; do not restore or add authentication. The current Render boot
+guard nevertheless requires `GE_NEXUS_ACCESS_PASSWORD` when `RENDER=true`, even
+though the password is not checked on requests. No public deployment or
+production environment has been verified. A development workflow is not
+evidence of production readiness.
 
 ## 9. Known limitations and risks
 
@@ -331,12 +373,17 @@ workflow is not evidence of a public deployment or production readiness.
 - The Python tools remain the core analysis engine and do not require AI
   credentials.
 - Stage 2 coordinator and provider fallback are implemented and offline-tested.
-- Stage 3 adds the web interface and API; its tests, start command, limitations,
-  and deployment status are recorded in the milestone log.
-- Provider model names must be supplied as environment variables. Live provider
-  requests, broker activity, and deployment remain unverified.
-- Before public deployment, configure access control and perform a controlled
-  provider check, then assess deployment separately.
+- The Stage 3 web interface, structured scan responses, browser-only result
+  history, provider status, and server-side connection-check route are
+  implemented. Development preview and offline tests have been verified.
+- Runtime status shows all four API keys present but all four model variables
+  missing; no live provider request was made.
+- The current Render startup guard requires `GE_NEXUS_ACCESS_PASSWORD`, although
+  authentication remains disabled and app/API routes are public. Do not change
+  authentication without a direct user request.
+- No public production deployment, real provider connectivity, or browser
+  installation flow has been verified. Research history is local to each
+  browser; no database is configured.
 
 ## 12. Milestone log
 
@@ -345,4 +392,5 @@ workflow is not evidence of a public deployment or production readiness.
 | Stage 1 - historical | GE Nexus identity, core-only README guide, plugin descriptions, and repository checks, as reported in the Stage 1 completion report. | The report records 315 passing unit tests and `git diff --check`; no live-data or broker operation was performed. Broker-flow tests use synthetic local placement/fill state. Results were not rerun for this guide update. | Continue preserving core interfaces; implement the optional AI coordinator only as a separately approved milestone. |
 | Handoff guide - reviewed 2026-10-29 | The guide was already present in the imported snapshot; its status, Git provenance, and conditional price-file handoff were reconciled with the current files. | Documentation-only change; `git diff --check` passed. No unit tests, live-data requests, provider calls, or broker operations were run. | Keep this guide current after future development stages. |
 | Stage 2 - optional AI coordinator | `trader-ai/provider.py` and `trader-ai/coordinator.py` provide ordered OpenRouter, OpenAI, Grok, and DeepSeek fallback; strict plan validation; bounded allowlisted CLI execution; and structured interpretation. `README.md` and this guide document invocation, configuration, and limits. `tests/test_ai_provider.py` and `tests/test_ai_coordinator.py` cover offline behavior. No strategy logic or broker utilities were changed. | Focused AI suite: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_ai_*.py' -v`, 44 passed. Broader offline suite discovered 359 tests, excluded all 18 `tests/test_broker.py` cases to avoid running ticket placement/fill state flows, and passed the remaining 341. All 11 coordinator CLI mappings parsed via `--help`. The repository checks passed: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_repo.py' -v` (11 passed) and `git diff --check`. No provider requests, live market-data requests, or broker operations were performed. | Test chosen model identifiers and provider credentials in a controlled provider check. Then assess deployment separately; no production readiness is claimed. |
+| Stage 3 - PWA and integration continuation (2026-11-06) | Preserved the Flask/PWA and deterministic scanner; corrected Python 3.8 coordinator compatibility, aligned browser ticker validation with the API, made Home show quote-only research, and stopped persisting expired server-side AI context IDs in browser history. Provider checks now require the expected `OK` response. Added scan-state tests, corrected stale repository assertions, and documented actual scanner and deployment behavior. Authentication code was not changed. | Flask and Gunicorn were installed from the existing requirements. The port-5000 preview started and desktop/mobile Home screenshots were reviewed. The complete offline suite passed: 386 tests. Python compilation, JavaScript syntax, manifest JSON, and `git diff --check` passed. Same-origin root, health, status, manifest, and service-worker routes returned 200. Runtime status showed all four keys present and model names missing. No live provider or market-data calls were made. No broker order was submitted. | Set user-selected model identifiers before live provider tests. Render deployment remains unverified; the existing startup guard requires `GE_NEXUS_ACCESS_PASSWORD` when `RENDER=true`, while the app routes remain public. Browser installation has not been interactively tested. |
 | Deployment assessment - future | Nothing implemented or verified. | Not run. | Assess hosting after provider configuration and operational limits are separately verified. |

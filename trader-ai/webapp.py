@@ -285,6 +285,12 @@ def _interpret_action(result, request_text):
     return result
 
 
+def _validate_provider_check_response(content):
+    if not isinstance(content, str) or content.strip().casefold() != "ok":
+        raise ValueError("provider did not return the expected health-check response")
+    return "OK"
+
+
 _SETUP_EXPLANATIONS = {
     "breakout_20d": (
         "The latest completed daily close was above the preceding 20 daily closes."
@@ -942,6 +948,7 @@ def check_provider_connection():
                 },
             ],
             deadline=time.monotonic() + coordinator.MAX_TOTAL_SECONDS,
+            validate_content=_validate_provider_check_response,
         )
     except coordinator.provider.ProviderUnavailable as exc:
         attempts = exc.attempts

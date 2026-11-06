@@ -25,7 +25,7 @@
     online: navigator.onLine,
     installPrompt: null,
     scans: [],
-    latestScan: null,
+    latestResearch: null,
     scanInput: "",
     scanError: null,
     instrumentSymbol: "",
@@ -142,7 +142,7 @@
     sideDot.className = `status-dot ${stateClass}`;
     labelNode.textContent = label;
     sideTitle.textContent = connected ? "Service responding" : state.online ? "Service unavailable" : "Offline";
-    sideCopy.textContent = connected ? "Python research tools can be requested." : "Live research needs the local service.";
+    sideCopy.textContent = connected ? "Market research is available." : "Live research needs the local service.";
   }
 
   function savedSymbols() {
@@ -162,7 +162,11 @@
         item && typeof item === "object" &&
         item.status === "completed" &&
         item.data !== undefined
-      ).slice(-HISTORY_LIMIT);
+      ).slice(-HISTORY_LIMIT).map((item) => {
+        const saved = { ...item };
+        delete saved.research_id;
+        return saved;
+      });
     } catch {
       return [];
     }
@@ -170,8 +174,11 @@
 
   function persistResearchResult(result, kind) {
     if (!result || result.status !== "completed") return false;
-    result.history_kind = kind;
-    state.scans.push(result);
+    const savedResult = { ...result, history_kind: kind };
+    // Server-side Q&A evidence is short-lived. Do not persist its handle where
+    // it could appear usable after the server has discarded the context.
+    delete savedResult.research_id;
+    state.scans.push(savedResult);
     state.scans = state.scans.slice(-HISTORY_LIMIT);
     try {
       let serialized = JSON.stringify(state.scans);
@@ -216,7 +223,7 @@
       const states = {
         missing_model: ["Model missing", "needs"],
         missing_key: ["Unavailable", "needs"],
-        authentication: ["Connection failed", "failed"],
+        authentication: ["Authentication failed", "failed"],
         model_unavailable: ["Model unavailable", "failed"],
         invalid_configuration: ["Connection failed", "failed"],
         invalid_configuration_or_request: ["Model unavailable", "failed"],
@@ -229,6 +236,7 @@
       const [text, className] = states[tested.category] || ["Connection failed", "failed"];
       return { text, className };
     }
+    if (provider.state === "invalid_endpoint") return { text: "Connection failed", className: "failed" };
     if (provider.key_configured && !provider.model_configured) return { text: "Model missing", className: "needs" };
     if (!provider.key_configured) return { text: "Unavailable", className: "needs" };
     return { text: "Configured", className: "" };
@@ -314,7 +322,7 @@
     return `<form class="research-question" data-research-question data-research-id="${esc(result.research_id)}">
       <label for="question-${esc(result.research_id)}">Ask about this result</label>
       <div class="question-input-row"><input class="text-input" id="question-${esc(result.research_id)}" name="question" maxlength="1000" placeholder="Ask what a finding means…" required><button class="button button-secondary" type="submit" ${busy ? "disabled" : ""}>${busy ? "Thinking…" : "Ask AI"}</button></div>
-      <p class="field-help">Answers use this returned Python result only. AI is optional.</p>
+      <p class="field-help">Answers are based only on this research result. AI is optional.</p>
       <div class="question-answer" aria-live="polite">${busy ? '<div class="skeleton skeleton-h14 skeleton-w70"></div>' : answerMarkup}</div>
     </form>`;
   }
@@ -327,7 +335,7 @@
         ? "The scanner did not have enough usable data to analyze any instruments. No findings were generated."
         : stateName === "failed"
           ? "The scanner could not complete this request. No findings were generated."
-          : "No qualifying findings were returned by the Python scanner for this completed run.";
+          : "The completed scan found no qualifying patterns for these symbols.";
       return `<div class="empty-state"><span class="empty-mark">${icon("info")}</span><p>${esc(message)}</p></div>`;
     }
     return `<div class="finding-grid">${findings.map((finding) => {
@@ -366,7 +374,7 @@
     if (summary.unconfirmed_candidates) metrics.push(["Not confirmed", summary.unconfirmed_candidates]);
     const explanations = (result?.research_explanation || []).map((item) => `<li>${esc(item)}</li>`).join("");
     return `<section class="panel result-panel">
-      <div class="result-top"><div><h3>${esc(title)}</h3><p>${esc(meta || "Returned by the existing Python scanner")}</p></div><span class="badge ${["completed", "no_findings"].includes(status) ? "verified" : ["failed", "data_unavailable"].includes(status) ? "failed" : ""}">${esc(summary.label || status.replaceAll("_", " "))}</span></div>
+      <div class="result-top"><div><h3>${esc(title)}</h3><p>${esc(meta || "Scan result")}</p></div><span class="badge ${["completed", "no_findings"].includes(status) ? "verified" : ["failed", "data_unavailable"].includes(status) ? "failed" : ""}">${esc(summary.label || status.replaceAll("_", " "))}</span></div>
       <div class="result-content">
         <p class="result-callout">${esc(summary.data_source || "Market-data source not reported")}${summary.data_as_of ? ` · Data as of ${esc(summary.data_as_of)}` : ""}</p>
         <div class="summary-grid">${metrics.map(([label, value]) => `<div class="summary-cell"><span>${esc(label)}</span><strong>${esc(value ?? 0)}</strong></div>`).join("")}</div>
@@ -389,7 +397,7 @@
     const symbols = state.scanInput || savedSymbols();
     return `<section class="panel scan-controls" aria-labelledby="${id}-heading">
       <p class="section-kicker">Market research</p><h2 id="${id}-heading">${esc(title)}</h2>
-      <p class="form-intro">GE Nexus selects daily or intraday research using the exchange clock.</p>
+      <p class="form-intro">GE Nexus picks the right scan for the current market session.</p>
       <form id="${id}">
         <input type="hidden" name="mode" value="auto">
         <div class="scan-inline"><div class="form-field"><label for="${id}-symbols">Tickers</label><input class="text-input" id="${id}-symbols" name="symbols" value="${esc(symbols)}" autocomplete="off" placeholder="Use your saved defaults" aria-describedby="${id}-help"><p class="field-help" id="${id}-help">Comma-separated · up to ${esc(state.universe?.max_symbols || 20)} U.S.-listed equity symbols.</p></div><button class="button" type="submit" data-scan-submit>${icon("scan")} Start Market Scan</button></div>
@@ -401,24 +409,28 @@
 
   function renderHome() {
     if (!state.status && !state.statusError) {
-      setView(`${pageHead("GE Nexus", "Market research, made clear.", "Start with the existing Python scanner. AI explanations are optional.")}<div class="home-grid"><section class="hero-panel"><div class="hero-content"><p class="hero-overline">GE Nexus research desk</p><h2>Start with the market evidence.</h2><p>Research results come from the scanner. No simulated prices or brokerage activity.</p><div class="hero-actions"><button class="button" type="button" data-start-market-scan>${icon("scan")} Start Market Scan</button></div></div></section><section class="panel system-card"><div class="skeleton skeleton-h14 skeleton-w40"></div><div class="skeleton skeleton-h14 skeleton-w70 skeleton-gap12"></div></section></div><div class="home-lower">${scanForm("home-scan-form", "Choose your tickers")}<section class="panel"><div class="panel-heading"><div><p class="section-kicker">Latest research</p><h2>Recent results</h2></div></div><div class="panel-body"><div class="empty-state"><p>Checking the research service.</p></div></div></section></div>`, true);
+      setView(`${pageHead("GE Nexus", "Market research, made clear.", "Start with market evidence. AI explanations are optional.")}<div class="home-grid"><section class="hero-panel"><div class="hero-content"><p class="hero-overline">GE Nexus research desk</p><h2>Start with the market evidence.</h2><p>Research findings are based on available market data. GE Nexus does not place trades.</p><div class="hero-actions"><button class="button" type="button" data-start-market-scan>${icon("scan")} Start Market Scan</button></div></div></section><section class="panel system-card"><div class="skeleton skeleton-h14 skeleton-w40"></div><div class="skeleton skeleton-h14 skeleton-w70 skeleton-gap12"></div></section></div><div class="home-lower">${scanForm("home-scan-form", "Choose your tickers")}<section class="panel"><div class="panel-heading"><div><p class="section-kicker">Latest research</p><h2>Recent results</h2></div></div><div class="panel-body"><div class="empty-state"><p>Checking the research service.</p></div></div></section></div>`, true);
       return;
     }
     const status = state.status || {};
     const engineOK = Boolean(status.engine?.available);
-    const latest = state.latestScan || [...state.scans].reverse().find((item) => item.data?.mode);
-    const latestContent = latest ? scanOutput(latest, "latest") : state.scanError
+    const latest = state.latestResearch || state.scans[state.scans.length - 1];
+    const latestContent = latest
+      ? (latest.data?.mode
+        ? scanOutput(latest, "latest")
+        : returnedFactsPanel("Latest instrument research", latest))
+      : state.scanError
       ? errorPanel("Latest scan", state.scanError, 'data-go="analysis"')
       : `<div class="empty-state"><span class="empty-mark">${icon("info")}</span><p>Your completed research will appear here and remain in this browser.</p></div>`;
     setView(`
-      ${pageHead("GE Nexus", "Market research, made clear.", "Run the existing scanner and review its returned findings.", `<button class="button button-secondary" type="button" data-refresh>${icon("reload")} Refresh</button>`)}
+      ${pageHead("GE Nexus", "Market research, made clear.", "Scan supported stocks and review the patterns in their data.", `<button class="button button-secondary" type="button" data-refresh>${icon("reload")} Refresh</button>`)}
       <div class="home-grid">
-        <section class="hero-panel"><div class="hero-content"><p class="hero-overline">GE Nexus research desk</p><h2>Start with the market evidence.</h2><p>Research results come from the scanner. No simulated prices or brokerage activity.</p>
+        <section class="hero-panel"><div class="hero-content"><p class="hero-overline">GE Nexus research desk</p><h2>Start with the market evidence.</h2><p>Research findings are based on available market data. GE Nexus does not place trades.</p>
           <div class="hero-actions"><button class="button" type="button" data-start-market-scan>${icon("scan")} Start Market Scan</button></div>
         </div></section>
         <section class="panel system-card"><div class="panel-heading"><div><p class="section-kicker">Service status</p><h2>${esc(status.service || "GE Nexus")}</h2></div><span class="inline-state"><span class="status-dot ${engineOK ? "" : "warn"}"></span>${engineOK ? "Ready" : "Unavailable"}</span></div>
-          <div class="status-main">${engineOK ? "Research tools available" : "Research tools unavailable"}</div>
-          <p class="status-description">Yahoo Finance chart data · may be delayed</p>
+          <div class="status-main">${engineOK ? "Research service ready" : "Research service unavailable"}</div>
+          <p class="status-description">Market data may be delayed</p>
           <div class="status-rule"></div><div class="status-foot"><span>Asset coverage</span><strong>U.S. equities</strong></div>
           <div class="status-foot status-foot-spaced"><span>Optional AI</span><strong>${(status.providers || []).some((provider) => provider.configured) ? "Configured" : "Unavailable"}</strong></div>
           ${state.statusError ? `<div class="notice error">${icon("info")}<span>${esc(state.statusError.message || state.statusError)}${errorDetails(state.statusError)}</span></div>` : ""}
@@ -446,10 +458,10 @@
     const bodyText = typeof body === "string"
       ? body
       : options.risk && body && typeof body === "object"
-        ? `${Array.isArray(checks) ? `${checks.length} checks returned. ` : ""}${body.block != null ? `${body.block} blocked. ` : ""}${body.pass != null ? `${body.pass} passed.` : ""}`.trim() || "The Python risk tool returned a result."
-        : "The Python tool returned an instrument result.";
+        ? `${Array.isArray(checks) ? `${checks.length} checks returned. ` : ""}${body.block != null ? `${body.block} blocked. ` : ""}${body.pass != null ? `${body.pass} passed.` : ""}`.trim() || "The risk check returned a result."
+        : "Instrument data was returned.";
     return `<section class="panel result-panel"><div class="result-top"><div><h3>${esc(title)}</h3><p>${esc(meta || "Tool response received")}</p></div><span class="badge ${result.status === "completed" ? "verified" : ""}">${esc(result.status || "returned")}</span></div>
-      <div class="result-content"><div class="result-callout">Returned by the existing Python tool. AI interpretation is separate.</div><p class="result-summary">${esc(bodyText)}</p>${checksMarkup}${researchQuestionForm(result)}${rawDetails("Technical details", result)}</div>
+      <div class="result-content"><div class="result-callout">Based on returned data. AI interpretation is separate.</div><p class="result-summary">${esc(bodyText)}</p>${checksMarkup}${researchQuestionForm(result)}${rawDetails("Technical details", result)}</div>
     </section>${interpretationPanel(result)}`;
   }
 
@@ -469,15 +481,15 @@
       ${pageHead("Research workspace", "Analysis", "Run a market scan, review instrument data, and check risk only when configured inputs exist.")}
       ${scanForm("analysis-scan-form", "Start a market scan")}
       <div class="content-grid analysis-grid">
-        <section class="panel form-panel" aria-labelledby="instrument-title"><p class="section-kicker">Instrument research</p><h2 id="instrument-title">Analyze one ticker</h2><p class="form-intro">Get the existing quote result for a supported U.S. equity.</p>
+        <section class="panel form-panel" aria-labelledby="instrument-title"><p class="section-kicker">Instrument research</p><h2 id="instrument-title">Analyze one ticker</h2><p class="form-intro">Review available price and quote data for a supported stock.</p>
           <form id="instrument-form" class="tool-form"><div class="form-field"><label for="instrument-symbol">Ticker symbol</label><input class="text-input" id="instrument-symbol" name="symbol" maxlength="7" value="${esc(state.instrumentSymbol)}" autocomplete="off" placeholder="e.g. MSFT" required></div><button class="button" type="submit">${icon("scan")} Get quote</button></form>
           <p class="form-status" id="instrument-status" role="status"></p>
           <div id="instrument-result">${returnedFactsPanel("Instrument quote", state.instrumentResult, state.instrumentError, { empty: "Enter a ticker to request actual quote-tool output.", retryAttr: "data-retry-instrument" })}</div>
         </section>
-        <section class="panel form-panel" aria-labelledby="risk-title"><p class="section-kicker">Risk review</p><h2 id="risk-title">Check configured risk limits</h2><p class="form-intro">This runs a non-writing check only when your order and risk files are available. It does not place orders.</p>
+        <section class="panel form-panel" aria-labelledby="risk-title"><p class="section-kicker">Risk review</p><h2 id="risk-title">Check configured risk limits</h2><p class="form-intro">Checks your saved proposed order against risk limits when those details are available. It never places an order.</p>
           <div class="data-grid"><div class="data-cell"><span>Required inputs</span><strong>${status.risk_inputs_available ? "Available" : "Not available"}</strong></div></div>
           <button class="button button-secondary" type="button" id="risk-button" ${status.risk_inputs_available ? "" : "disabled"}>${icon("shield")} Run risk checks</button>
-          <p class="form-status" id="risk-status" role="status">${status.risk_inputs_available ? "" : "Risk checks are unavailable because required configured inputs are not reported."}</p>
+          <p class="form-status" id="risk-status" role="status">${status.risk_inputs_available ? "" : "Risk checks are unavailable because required details are not available."}</p>
           <div id="risk-result">${returnedFactsPanel("Risk check result", state.riskResult, state.riskError, { risk: true, empty: "Risk output will appear here only after the configured tool returns a result.", retryAttr: "data-retry-risk" })}</div>
         </section>
       </div>
@@ -510,7 +522,7 @@
         <div class="aside-stack">
           <section class="panel settings-card" aria-labelledby="provider-title">
             <p class="section-kicker">Optional AI</p><h2 id="provider-title">AI providers</h2>
-            <p class="form-intro">AI explains returned Python results. Market scanning works without it.</p>
+            <p class="form-intro">AI explains research findings. Market scanning works without it.</p>
             <div class="provider-config">${providerRows(status.providers || [])}</div>
             <div class="form-actions"><button class="button" type="button" id="provider-check" ${state.providerTestBusy ? "disabled" : ""}>Test connection</button></div>
             <div id="provider-test-output" aria-live="polite">${settingsProviderContent()}</div>
@@ -602,15 +614,15 @@
       return;
     }
     submit.disabled = true;
-    statusNode.textContent = "Waiting for the Python scanner…";
-    resultNode.innerHTML = `<section class="panel result-panel"><div class="result-top"><div><h3>Scan in progress</h3><p>Waiting for the local tool response.</p></div></div><div class="result-content"><div class="skeleton skeleton-h14 skeleton-w50"></div><div class="skeleton skeleton-h14 skeleton-w83 skeleton-gap12"></div></div></section>`;
+    statusNode.textContent = "Running your market scan…";
+    resultNode.innerHTML = `<section class="panel result-panel"><div class="result-top"><div><h3>Scan in progress</h3><p>Checking available market data.</p></div></div><div class="result-content"><div class="skeleton skeleton-h14 skeleton-w50"></div><div class="skeleton skeleton-h14 skeleton-w83 skeleton-gap12"></div></div></section>`;
     state.scanError = null;
     try {
       const payload = { mode };
       if (symbols.length) payload.symbols = symbols;
       const result = await api(API.scanner, { method: "POST", body: JSON.stringify(payload) });
       const stored = persistResearchResult(result, "scan");
-      state.latestScan = result;
+      state.latestResearch = result;
       state.scanError = null;
       state.scanInput = input;
       statusNode.textContent = result.status !== "completed"
@@ -631,7 +643,7 @@
     const symbolInput = form.querySelector('[name="symbol"]');
     const symbol = symbolInput.value.trim().toUpperCase();
     const statusNode = document.getElementById("instrument-status");
-    if (!/^[A-Z][A-Z0-9.-]{0,9}$/.test(symbol)) {
+    if (!/^[A-Z][A-Z0-9]{0,4}(?:[.-][A-Z])?$/.test(symbol)) {
       statusNode.textContent = "Enter one valid ticker symbol.";
       symbolInput.focus();
       return;
@@ -639,12 +651,13 @@
     state.instrumentSymbol = symbol;
     const button = form.querySelector("button[type=submit]");
     button.disabled = true;
-    statusNode.textContent = "Requesting the quote tool…";
+    statusNode.textContent = "Getting available quote data…";
     document.getElementById("instrument-result").innerHTML = '<div class="skeleton skeleton-h14 skeleton-w50"></div><div class="skeleton skeleton-h14 skeleton-w83 skeleton-gap12"></div>';
     state.instrumentError = null;
     try {
       state.instrumentResult = await api(API.instrument, { method: "POST", body: JSON.stringify({ symbol }) });
       const stored = persistResearchResult(state.instrumentResult, "instrument");
+      state.latestResearch = state.instrumentResult;
       statusNode.textContent = `Quote returned for ${symbol}${stored ? " · Saved in this browser." : " · Could not save to browser storage."}.`;
       render();
     } catch (error) {
@@ -661,7 +674,7 @@
     const status = document.getElementById("risk-status");
     if (!button || button.disabled) return;
     button.disabled = true;
-    status.textContent = "Requesting configured risk checks…";
+    status.textContent = "Checking the saved order against configured risk limits…";
     document.getElementById("risk-result").innerHTML = '<div class="skeleton skeleton-h14 skeleton-w50"></div><div class="skeleton skeleton-h14 skeleton-w83 skeleton-gap12"></div>';
     state.riskError = null;
     try {
@@ -857,7 +870,7 @@
   }
 
   state.scans = loadResearchHistory();
-  state.latestScan = [...state.scans].reverse().find((item) => item.data?.mode) || null;
+  state.latestResearch = state.scans[state.scans.length - 1] || null;
   render();
   loadStatus();
 })();

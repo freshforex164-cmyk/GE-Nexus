@@ -160,9 +160,14 @@ Provider credentials must be set through Replit Secrets, Render environment
 variables, or another secure environment store. Configure each provider's API
 key and model variable as described above. The provider priority remains
 OpenRouter, OpenAI, Grok, then DeepSeek. On Render, set
-`GE_NEXUS_ACCESS_PASSWORD`; the app and API require HTTP Basic authentication
-with username `ge-nexus` and that password. The health endpoint remains public
-for service checks. Request limits are best-effort per process.
+`GE_NEXUS_ACCESS_PASSWORD` to satisfy the current Render startup check.
+Authentication is disabled in the web app, so this value does not protect the
+app or API; both are publicly accessible. The health endpoint is also public.
+Request limits are best-effort per process. Use this Render start command:
+
+```bash
+gunicorn --chdir trader-ai --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 135 webapp:app
+```
 
 ## The eleven
 

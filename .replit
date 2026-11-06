@@ -9,3 +9,31 @@ expertMode = true
 
 [deployment]
 run = ["gunicorn", "--chdir", "trader-ai", "--bind", "0.0.0.0:5000", "--workers", "1", "--threads", "4", "--timeout", "135", "webapp:app"]
+
+[workflows]
+runButton = "Project"
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Start application"
+
+[[workflows.workflow]]
+name = "Start application"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "gunicorn --chdir trader-ai --bind 0.0.0.0:5000 --workers 1 --threads 4 --timeout 135 webapp:app"
+waitForPort = 5000
+
+[workflows.workflow.metadata]
+outputType = "webview"
+
+[[ports]]
+localPort = 5000
+externalPort = 80

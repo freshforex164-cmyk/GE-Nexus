@@ -1,0 +1,1 @@
+- [Public access rule](public-access.md) — Keep GE Nexus unauthenticated and publicly accessible; do not add or restore authentication.

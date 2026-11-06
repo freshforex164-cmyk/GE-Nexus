@@ -44,7 +44,8 @@ class Repo(unittest.TestCase):
 
     def test_root_matches_the_reel(self):
         workspace_dirs = {
-            ".agents", ".cache", ".local", ".pythonlibs", ".upm", "attached_assets"
+            ".agents", ".cache", ".local", ".python-version", ".pythonlibs",
+            ".upm", "attached_assets"
         }
         root = sorted(d for d in os.listdir(ROOT)
                       if d != ".git" and d not in workspace_dirs)
@@ -84,7 +85,9 @@ class Repo(unittest.TestCase):
         with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as fh:
             readme = " ".join(fh.read().split())
         self.assertTrue(readme.startswith("# GE Nexus"))
-        for line in (ABOUT,
+        for line in (
+                     "GE Nexus is a Python stock-analysis toolkit with eleven existing Claude skill instructions and an optional browser-based PWA.",
+                     "Its core command-line tools calculate scans, entry and exit plans, simulations, position sizes, and risk checks without an AI API key.",
                      "https://github.com/Jakeschincariol/day-trader-skill install skill",
                      "/plugin marketplace add Jakeschincariol/day-trader-skill",
                      "/plugin install day-trader-skill@day-trader-skill",

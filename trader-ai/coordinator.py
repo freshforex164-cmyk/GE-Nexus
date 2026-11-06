@@ -709,7 +709,7 @@ def _run_one(action, workspace, deadline):
             return result
         if scanner_no_match and not (
             data.get("created_by") == "trader-scanner"
-            and data.get("mode") == action["tool"].removeprefix("scanner_")
+            and data.get("mode") == action["tool"][len("scanner_"):]
             and isinstance(data.get("hits"), list)
             and not data["hits"]
         ):

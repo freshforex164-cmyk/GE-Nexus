@@ -45,6 +45,23 @@ class WebAppTests(unittest.TestCase):
         self.assertFalse(response.json["analysis_history"]["server_database"])
         self.assertNotIn(secret, json.dumps(response.json))
 
+    def test_provider_status_rejects_invalid_endpoints_without_exposing_keys(self):
+        secret = "never-return-this-key"
+        with mock.patch.dict(
+            os.environ,
+            {
+                "OPENROUTER_API_KEY": secret,
+                "OPENROUTER_MODEL": "chosen-model",
+                "OPENROUTER_BASE_URL": "http://invalid.example/v1/chat/completions",
+            },
+            clear=True,
+        ):
+            response = self.client.get("/api/status")
+        provider = response.json["providers"][0]
+        self.assertEqual(provider["state"], "invalid_endpoint")
+        self.assertFalse(provider["configured"])
+        self.assertNotIn(secret, json.dumps(response.json))
+
     def test_render_requires_an_access_password(self):
         with self.assertRaisesRegex(RuntimeError, "GE_NEXUS_ACCESS_PASSWORD"):
             webapp._validate_deployment_configuration({"RENDER": "true"})
@@ -72,6 +89,11 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(health.status_code, 200)
         self.assertEqual(authorized_page.status_code, 200)
         self.assertEqual(authorized_status.status_code, 200)
+
+    def test_app_remains_public_without_a_password(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(self.client.get("/").status_code, 200)
+            self.assertEqual(self.client.get("/api/status").status_code, 200)
 
     def test_scanner_route_uses_existing_validated_action_and_preserves_results(self):
         expected = {
@@ -102,6 +124,117 @@ class WebAppTests(unittest.TestCase):
         plan = run.call_args.args[0]
         self.assertEqual(plan["actions"][0]["tool"], "scanner_daily")
         self.assertEqual(plan["actions"][0]["arguments"]["symbols"], ["AAPL"])
+
+    def test_completed_scan_with_no_findings_is_not_reported_as_failed(self):
+        result = {
+            "id": "a1",
+            "tool": "scanner_daily",
+            "status": "completed",
+            "data": {
+                "created_by": "trader-scanner",
+                "created_at": "2026-11-06T15:00:00Z",
+                "mode": "daily",
+                "universe": 2,
+                "scanned": 2,
+                "failed": 0,
+                "failed_symbols": [],
+                "source": "yahoo",
+                "as_of": "2026-11-05 close",
+                "hits": [],
+            },
+        }
+        with mock.patch.object(
+            webapp, "_execute_validated_action", return_value=(result, [])
+        ):
+            response = self.client.post(
+                "/api/scanner", json={"mode": "daily", "symbols": ["AAPL", "MSFT"]}
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["status"], "completed")
+        self.assertEqual(response.json["scan_summary"]["status"], "no_findings")
+        self.assertEqual(response.json["scan_summary"]["instruments_analyzed"], 2)
+        self.assertEqual(response.json["scan_summary"]["candidate_count"], 0)
+        self.assertEqual(response.json["research_findings"], [])
+
+    def test_partial_scan_preserves_findings_when_ai_is_unavailable(self):
+        result = {
+            "id": "a1",
+            "tool": "scanner_daily",
+            "status": "completed",
+            "data": {
+                "created_by": "trader-scanner",
+                "created_at": "2026-11-06T15:00:00Z",
+                "mode": "daily",
+                "universe": 2,
+                "scanned": 1,
+                "failed": 1,
+                "failed_symbols": ["ZZZZ"],
+                "source": "yahoo",
+                "as_of": "2026-11-05 close",
+                "hits": [{
+                    "symbol": "AAPL",
+                    "setups": ["breakout_20d"],
+                    "price": 200.0,
+                    "close_date": "2026-11-05",
+                    "rsi": 56.2,
+                    "volume": 1200000,
+                }],
+            },
+        }
+        with mock.patch.object(
+            webapp, "_execute_validated_action", return_value=(result, [])
+        ), mock.patch.object(
+            webapp.coordinator,
+            "_interpret",
+            return_value=(None, {"category": "providers_unavailable"}, None),
+        ):
+            response = self.client.post(
+                "/api/scanner", json={"mode": "daily", "symbols": ["AAPL", "ZZZZ"]}
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["scan_summary"]["status"], "partial")
+        self.assertEqual(response.json["scan_summary"]["data_errors"], 1)
+        self.assertEqual(response.json["scan_summary"]["data_error_symbols"], ["ZZZZ"])
+        self.assertEqual(response.json["research_findings"][0]["symbol"], "AAPL")
+        self.assertEqual(response.json["research_findings"][0]["price"], 200.0)
+        self.assertNotIn("stop", response.json["research_findings"][0])
+        self.assertEqual(response.json["ai_status"], "unavailable")
+        self.assertEqual(response.json["status"], "completed")
+
+    def test_complete_scan_failure_and_unavailable_data_have_distinct_states(self):
+        failed = {"id": "a1", "tool": "scanner_daily", "status": "failed"}
+        with mock.patch.object(
+            webapp, "_execute_validated_action", return_value=(failed, [])
+        ), mock.patch.object(webapp, "_interpret_action") as interpret:
+            response = self.client.post(
+                "/api/scanner", json={"mode": "daily", "symbols": ["AAPL"]}
+            )
+        self.assertEqual(response.json["scan_summary"]["status"], "failed")
+        interpret.assert_not_called()
+
+        unavailable = {
+            "id": "a1",
+            "tool": "scanner_daily",
+            "status": "completed",
+            "data": {
+                "created_by": "trader-scanner",
+                "mode": "daily",
+                "universe": 2,
+                "scanned": 0,
+                "failed": 2,
+                "failed_symbols": ["AAPL", "MSFT"],
+                "hits": [],
+            },
+        }
+        with mock.patch.object(
+            webapp, "_execute_validated_action", return_value=(unavailable, [])
+        ), mock.patch.object(webapp, "_interpret_action") as interpret:
+            response = self.client.post(
+                "/api/scanner", json={"mode": "daily", "symbols": ["AAPL", "MSFT"]}
+            )
+        self.assertEqual(response.json["status"], "completed")
+        self.assertEqual(response.json["scan_summary"]["status"], "data_unavailable")
+        interpret.assert_not_called()
 
     def test_scanner_uses_default_universe_and_exposes_supported_assets(self):
         response = self.client.get("/api/universe")
@@ -237,6 +370,10 @@ class WebAppTests(unittest.TestCase):
         self.assertTrue(response.json["verified"])
         self.assertEqual(response.json["provider"], "OpenRouter")
         request.assert_called_once()
+        self.assertIs(
+            request.call_args.kwargs["validate_content"],
+            webapp._validate_provider_check_response,
+        )
 
         unavailable = webapp.coordinator.provider.ProviderUnavailable(
             [{"provider": "OpenRouter", "category": "missing_model"}]
@@ -248,6 +385,11 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(response.status_code, 503)
         self.assertFalse(response.json["verified"])
         self.assertEqual(response.json["attempts"][0]["category"], "missing_model")
+
+    def test_provider_health_check_requires_the_expected_reply(self):
+        self.assertEqual(webapp._validate_provider_check_response(" OK\n"), "OK")
+        with self.assertRaises(ValueError):
+            webapp._validate_provider_check_response("provider returned a different response")
 
     def test_analysis_route_calls_real_coordinator_contract(self):
         result = {
