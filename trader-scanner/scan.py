@@ -894,9 +894,11 @@ def cmd_daily(a):
         data, failed = fetch_spark(symbols, "3mo", "1d", a.pause, a)
     hits, counts, last_date = scan_daily(data, symbols, now, a.min_price, a.min_volume)
     nfailed = len(symbols) - counts["fetched"]
+    failed_symbols = sorted(sym for sym in symbols if sym not in data)
     as_of = ("%s close" % last_date.isoformat()) if last_date else None
     doc = {"created_by": "trader-scanner", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "mode": "daily",
            "as_of": as_of, "universe": len(symbols), "scanned": counts["scanned"], "failed": nfailed,
+           "failed_symbols": failed_symbols,
            "source": "yahoo", "filters": {"min_price": a.min_price, "min_volume": a.min_volume},
            "note": NOTE, "hits": hits}
     if a.offline:
@@ -981,10 +983,12 @@ def cmd_orb(a):
                                      a.max_confirm)
     failed = dict(failed or {})
     failed.update(failed2)
-    nfailed = len([s for s in symbols if s in failed])
+    failed_symbols = sorted(set(s for s in symbols if s not in data) | set(failed))
+    nfailed = len(failed_symbols)
     as_of = "%s %s ET" % (day.isoformat(), cutoff.strftime("%H:%M"))
     doc = {"created_by": "trader-scanner", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "mode": "orb",
            "as_of": as_of, "universe": len(symbols), "scanned": counts["scanned"], "failed": nfailed,
+           "failed_symbols": failed_symbols,
            "unconfirmed": counts["unconfirmed"], "source": "yahoo", "or_minutes": a.or_minutes,
            "interval": "%dm" % BAR_MIN,
            "filters": {"min_price": a.min_price, "min_volume": a.min_volume}, "note": NOTE, "hits": hits}

@@ -506,6 +506,8 @@ class Cli(unittest.TestCase):
         self.assertIn("Fetched 2 of 17 charts (15 failed or had no data)", text)
         doc = self.read(self.wl)
         self.assertEqual((doc["mode"], doc["universe"], doc["scanned"], doc["failed"]), ("daily", 17, 2, 15))
+        self.assertEqual(len(doc["failed_symbols"]), 15)
+        self.assertIn("AAPL", doc["failed_symbols"])
         self.assertEqual(doc["hits"], [{"symbol": "KO", "setups": ["breakout_20d"], "price": 93.9,
                                         "close_date": "2026-10-16", "rsi": 75.3, "volume": 3680307}])
         self.assertEqual(doc["as_of"], "2026-10-16 close")

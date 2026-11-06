@@ -167,7 +167,9 @@ def _http_category(status):
         return "rate_limited"
     if 500 <= status <= 599:
         return "server_error"
-    if status in (400, 404, 422):
+    if status == 404:
+        return "model_unavailable"
+    if status in (400, 422):
         return "invalid_configuration_or_request"
     return "http_error"
 

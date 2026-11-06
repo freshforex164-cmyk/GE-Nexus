@@ -9,10 +9,12 @@ import hmac
 import math
 import os
 import re
+import secrets
 import sys
 import threading
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -37,6 +39,10 @@ MAX_SCANS_PER_WINDOW = 12
 SCAN_WINDOW_SECONDS = 60
 TICKER_RE = re.compile(r"^[A-Z][A-Z0-9]{0,4}(?:[.-][A-Z])?$")
 ACCESS_PASSWORD_ENV = "GE_NEXUS_ACCESS_PASSWORD"
+MAX_RESEARCH_CONTEXTS = 80
+RESEARCH_CONTEXT_TTL = 60 * 60
+_research_contexts = OrderedDict()
+_research_contexts_lock = threading.Lock()
 
 
 def _validate_deployment_configuration(environ):
@@ -208,10 +214,12 @@ def _provider_status():
                 "configured": configured,
                 "connection_verified": False,
                 "state": (
-                    "configured_unverified"
+                    "configured"
                     if configured
                     else "invalid_endpoint"
                     if has_key and has_model and not endpoint_valid
+                    else "model_missing"
+                    if has_key and not has_model
                     else "needs_configuration"
                 ),
             }
@@ -256,10 +264,17 @@ def _execute_validated_action(tool, arguments, request_text):
 
 def _interpret_action(result, request_text):
     plan = {"intent": request_text}
+    evidence_result = dict(result)
+    if result.get("scan_summary") or result.get("research_findings"):
+        evidence_result["data"] = {
+            "scan_summary": result.get("scan_summary"),
+            "findings": result.get("research_findings", []),
+            "explanation": result.get("research_explanation", []),
+        }
     interpretation, error, interpretation_provider = coordinator._interpret(
         request_text,
         plan,
-        [result],
+        [evidence_result],
         time.monotonic() + coordinator.MAX_TOTAL_SECONDS,
     )
     result["interpretation"] = interpretation
@@ -268,6 +283,236 @@ def _interpret_action(result, request_text):
         result["interpretation_error"] = error
     result["ai_status"] = "complete" if interpretation else "unavailable"
     return result
+
+
+_SETUP_EXPLANATIONS = {
+    "breakout_20d": (
+        "The latest completed daily close was above the preceding 20 daily closes."
+    ),
+    "bull_flag": (
+        "The prior 10-session move was over 10%, followed by five closes in a range under 5%."
+    ),
+    "reclaim_ma20": (
+        "The latest close moved above its 20-day average after the previous close was below its prior average."
+    ),
+    "oversold": "The scanner's 14-day Wilder RSI was below 30.",
+    "oversold_bounce": (
+        "The prior day's 14-day Wilder RSI was below 30 and the latest close was higher."
+    ),
+    "orb": (
+        "A completed five-minute bar closed above the high of the opening range."
+    ),
+}
+_SETUP_LABELS = {
+    "breakout_20d": "20-day breakout",
+    "bull_flag": "Bull flag pattern",
+    "reclaim_ma20": "20-day average reclaim",
+    "oversold": "RSI below 30",
+    "oversold_bounce": "Oversold bounce",
+    "orb": "Opening-range breakout",
+}
+
+
+def _scan_summary(result, requested_symbols, mode):
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    counts = data.get("counts") if isinstance(data.get("counts"), dict) else {}
+    hits = data.get("hits") if isinstance(data.get("hits"), list) else []
+    requested = int(data.get("universe") or len(requested_symbols))
+    analyzed = int(data.get("scanned") or counts.get("scanned") or 0)
+    errors = max(0, int(data.get("failed") or 0))
+    unconfirmed = max(0, int(data.get("unconfirmed") or counts.get("unconfirmed") or 0))
+    failed_symbols = data.get("failed_symbols")
+    if not isinstance(failed_symbols, list):
+        failed_symbols = []
+    failed_symbols = [
+        symbol for symbol in failed_symbols
+        if isinstance(symbol, str) and TICKER_RE.fullmatch(symbol)
+    ][:MAX_SYMBOLS]
+    if result.get("status") != "completed":
+        state = "failed"
+        label = "Scan failed"
+    elif analyzed == 0 and errors:
+        state = "data_unavailable"
+        label = "Data unavailable"
+    elif analyzed == 0:
+        state = "data_unavailable"
+        label = "No usable market data"
+    elif errors or unconfirmed:
+        state = "partial"
+        label = "Completed with partial data"
+    elif not hits:
+        state = "no_findings"
+        label = "No qualifying findings"
+    else:
+        state = "completed"
+        label = "Completed"
+    return {
+        "status": state,
+        "label": label,
+        "completed_at": data.get("created_at"),
+        "instruments_checked": requested,
+        "instruments_analyzed": analyzed,
+        "candidate_count": len(hits),
+        "data_errors": errors,
+        "data_error_symbols": failed_symbols,
+        "unconfirmed_candidates": unconfirmed,
+        "data_source": (
+            "Yahoo Finance chart data (unofficial; may be delayed)"
+            if data.get("source") == "yahoo"
+            else data.get("source") or "Not reported by the scanner"
+        ),
+        "data_as_of": data.get("as_of"),
+        "mode": mode,
+        "note": (
+            "The scanner returns rule-matched research observations, not trade recommendations."
+        ),
+    }
+
+
+def _research_findings(data):
+    hits = data.get("hits") if isinstance(data.get("hits"), list) else []
+    mode = data.get("mode")
+    findings = []
+    for hit in hits:
+        if not isinstance(hit, dict):
+            continue
+        symbol = hit.get("symbol")
+        if not isinstance(symbol, str) or not TICKER_RE.fullmatch(symbol):
+            continue
+        setup_keys = hit.get("setups") if isinstance(hit.get("setups"), list) else []
+        findings.append(
+            {
+                "symbol": symbol,
+                "setups": [
+                    {
+                        "key": key,
+                        "label": _SETUP_LABELS[key],
+                        "explanation": _SETUP_EXPLANATIONS[key],
+                    }
+                    for key in setup_keys
+                    if isinstance(key, str) and key in _SETUP_EXPLANATIONS
+                ],
+                "price": hit.get("price"),
+                "price_as_of": hit.get("close_date") or data.get("as_of"),
+                "price_source": (
+                    "Yahoo Finance chart data (unofficial; may be delayed)"
+                    if data.get("source") == "yahoo"
+                    else data.get("source")
+                ),
+                "rsi_14": hit.get("rsi"),
+                "volume": hit.get("volume"),
+                "bar_time": hit.get("at"),
+                "opening_range_low": hit.get("or_low"),
+                "opening_range_high": hit.get("or_high"),
+                "percent_above_range": hit.get("pct_over"),
+            }
+        )
+    return findings
+
+
+def _structure_scan_result(result, requested_symbols, mode):
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    summary = _scan_summary(result, requested_symbols, mode)
+    findings = _research_findings(data)
+    explanation = [
+        (
+            "Daily mode checks completed daily closes for 20-day breakouts, bull-flag patterns, "
+            "20-day-average reclaims, and RSI-14 oversold conditions. The current session's daily "
+            "bar is excluded until it closes."
+        )
+        if mode == "daily"
+        else (
+            "Opening-range mode checks completed five-minute bars against the first 15 minutes "
+            "of the regular session. It runs only when the market clock confirms a usable session."
+        ),
+        "Yahoo Finance data is unofficial and may be delayed or unavailable.",
+        "The scanner does not calculate an entry, stop, target, or risk/reward for these findings.",
+    ]
+    result["scan_summary"] = summary
+    result["research_findings"] = findings
+    result["research_explanation"] = explanation
+    return result
+
+
+def _configured_orb_cutoff():
+    """Read only the bounded, regular runtime config used by the scanner."""
+    path = ROOT / "trader" / "config.json"
+    try:
+        info = path.lstat()
+        if path.is_symlink() or not path.is_file() or info.st_size > coordinator.RUNTIME_FILE_LIMIT:
+            return "15:30"
+        document = json.loads(path.read_text(encoding="utf-8"))
+        value = document.get("no_entries_after") if isinstance(document, dict) else None
+        if isinstance(value, str) and re.fullmatch(r"\d{2}:\d{2}", value):
+            datetime.strptime(value, "%H:%M")
+            return value
+    except (OSError, UnicodeError, ValueError, TypeError):
+        pass
+    return "15:30"
+
+
+def _automatic_scan_mode():
+    """Choose intraday only when the existing exchange clock confirms a valid window."""
+    clock, _warnings = _execute_validated_action(
+        "alerts_clock", {}, "Check the exchange clock before choosing a scanner"
+    )
+    clock_data = clock.get("data") if isinstance(clock.get("data"), dict) else {}
+    if (
+        clock.get("status") != "completed"
+        or not clock_data.get("calendar_known")
+        or not clock_data.get("open")
+    ):
+        return "daily", "The exchange clock did not confirm a usable intraday session."
+    try:
+        now = datetime.strptime(clock_data["now_new_york"], "%Y-%m-%d %H:%M")
+        opens = datetime.strptime(clock_data["opens"], "%H:%M").time()
+        closes = datetime.strptime(clock_data["closes"], "%H:%M").time()
+        last_entry = datetime.strptime(_configured_orb_cutoff(), "%H:%M").time()
+        opening_range_end = datetime.combine(now.date(), opens).replace(
+            minute=opens.minute
+        )
+        opening_range_end += __import__("datetime").timedelta(minutes=20)
+        end = min(
+            datetime.combine(now.date(), closes),
+            datetime.combine(now.date(), last_entry),
+        )
+        if opening_range_end <= now < end:
+            return "orb", "The exchange clock confirms an open session and a usable opening-range window."
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return "daily", "The exchange clock response was incomplete; a daily-close scan is safer."
+    return "daily", "Outside the opening-range scan window, the daily-close scan is used."
+
+
+def _remember_research(result):
+    """Retain bounded completed scanner/quote evidence for result-grounded questions."""
+    if result.get("status") != "completed":
+        return None
+    evidence = {
+        "tool": result.get("tool"),
+        "status": result.get("status"),
+        "data": result.get("data"),
+        "scan_summary": result.get("scan_summary"),
+        "research_findings": result.get("research_findings"),
+        "research_explanation": result.get("research_explanation"),
+    }
+    try:
+        if len(json.dumps(evidence, ensure_ascii=False)) > 12000:
+            return None
+    except (TypeError, ValueError):
+        return None
+    now = time.monotonic()
+    with _research_contexts_lock:
+        expired = [
+            key for key, value in _research_contexts.items()
+            if now - value["created"] > RESEARCH_CONTEXT_TTL
+        ]
+        for key in expired:
+            _research_contexts.pop(key, None)
+        research_id = secrets.token_urlsafe(24)
+        _research_contexts[research_id] = {"created": now, "evidence": evidence}
+        while len(_research_contexts) > MAX_RESEARCH_CONTEXTS:
+            _research_contexts.popitem(last=False)
+    return research_id
 
 
 def _single_symbol(body):
@@ -380,7 +625,11 @@ def status():
                 and _has_regular_runtime_file("config.json")
             ),
             "watchlist": _watchlist_summary(),
-            "analysis_history": {"available": False, "persistent": False},
+            "analysis_history": {
+                "available": True,
+                "persistent": "browser_local_storage",
+                "server_database": False,
+            },
             "capabilities": {
                 "natural_language_coordination": True,
                 "market_scanner": True,
@@ -465,10 +714,10 @@ def scan():
     body, error = _json_body()
     if error:
         return error
-    mode = body.get("mode")
+    mode = body.get("mode", "auto")
     symbols = body.get("symbols", list(DEFAULT_SCAN_SYMBOLS))
-    if mode not in ("daily", "orb"):
-        return _api_error("invalid_mode", "Choose daily or opening-range scan.", 400)
+    if mode not in ("auto", "daily", "orb"):
+        return _api_error("invalid_mode", "Choose automatic, daily, or opening-range scan.", 400)
     if (
         not isinstance(symbols, list)
         or not 1 <= len(symbols) <= MAX_SYMBOLS
@@ -501,18 +750,33 @@ def scan():
         response.headers["Retry-After"] = str(retry_after)
         return response
 
+    mode_reason = None
+    if mode == "auto":
+        mode, mode_reason = _automatic_scan_mode()
     request_text = "Scan " + " ".join(normalized)
     tool = "scanner_daily" if mode == "daily" else "scanner_orb"
     result, warnings = _execute_validated_action(
         tool, {"symbols": normalized}, request_text
     )
     result["requested_symbols"] = normalized
-    if result.get("status") == "completed":
+    _structure_scan_result(result, normalized, mode)
+    if mode_reason:
+        result["scan_mode_reason"] = mode_reason
+    if result.get("status") == "completed" and result["scan_summary"]["status"] not in (
+        "data_unavailable",
+        "failed",
+    ):
         result = _interpret_action(result, request_text)
+    elif result.get("status") == "completed":
+        result["ai_status"] = "unavailable"
+        result["interpretation_error"] = {
+            "category": "insufficient_market_data",
+            "message": "There was not enough usable market data for an AI explanation.",
+        }
     if warnings:
         result["runtime_input_warnings"] = warnings
-    status_code = 200 if result.get("status") == "completed" else 502
-    return jsonify(result), status_code
+    result["research_id"] = _remember_research(result)
+    return jsonify(result)
 
 
 @app.post("/api/instrument")
@@ -548,8 +812,69 @@ def analyze_instrument():
         result = _interpret_action(result, request_text)
     if warnings:
         result["runtime_input_warnings"] = warnings
-    status_code = 200 if result.get("status") == "completed" else 502
-    return jsonify(result), status_code
+    result["research_id"] = _remember_research(result)
+    return jsonify(result)
+
+
+@app.post("/api/research/ask")
+def ask_research_question():
+    body, error = _json_body()
+    if error:
+        return error
+    research_id = body.get("research_id")
+    question = body.get("question")
+    if not isinstance(research_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{24,64}", research_id):
+        return _api_error("invalid_research_id", "Choose a recent research result first.", 400)
+    if not isinstance(question, str) or not question.strip() or len(question) > 1000:
+        return _api_error("invalid_question", "Enter a question of 1,000 characters or fewer.", 400)
+
+    allowed, retry_after = _limiter.allow(
+        ("research_question", _remote_key()),
+        MAX_REQUESTS_PER_WINDOW,
+        ANALYSIS_WINDOW_SECONDS,
+    )
+    if not allowed:
+        response = jsonify(
+            {
+                "error": {
+                    "category": "rate_limited",
+                    "message": "Too many questions. Wait before trying again.",
+                }
+            }
+        )
+        response.status_code = 429
+        response.headers["Retry-After"] = str(retry_after)
+        return response
+
+    now = time.monotonic()
+    with _research_contexts_lock:
+        context = _research_contexts.get(research_id)
+        if context and now - context["created"] > RESEARCH_CONTEXT_TTL:
+            _research_contexts.pop(research_id, None)
+            context = None
+    if not context:
+        return _api_error(
+            "research_context_expired",
+            "That result is no longer available for AI questions. Run the research again.",
+            410,
+        )
+    try:
+        answer = coordinator.answer_research_question(
+            question,
+            context["evidence"],
+            deadline=time.monotonic() + coordinator.MAX_TOTAL_SECONDS,
+        )
+    except coordinator.provider.ProviderUnavailable as exc:
+        return jsonify(
+            {
+                "ai_status": "unavailable",
+                "message": "AI could not answer this question. The original research result is unchanged.",
+                "attempts": exc.attempts,
+            }
+        )
+    except ValueError as exc:
+        return _api_error("invalid_question", str(exc), 400)
+    return jsonify({"ai_status": "complete", **answer})
 
 
 @app.post("/api/risk")
@@ -619,15 +944,33 @@ def check_provider_connection():
             deadline=time.monotonic() + coordinator.MAX_TOTAL_SECONDS,
         )
     except coordinator.provider.ProviderUnavailable as exc:
+        attempts = exc.attempts
+        categories = {
+            "missing_model": "model_missing",
+            "missing_key": "unavailable",
+            "authentication": "connection_failed",
+            "model_unavailable": "model_unavailable",
+            "rate_limited": "temporarily_unavailable",
+            "server_error": "temporarily_unavailable",
+            "timeout": "temporarily_unavailable",
+            "connection_error": "temporarily_unavailable",
+            "deadline_exceeded": "temporarily_unavailable",
+            "invalid_configuration": "connection_failed",
+            "invalid_configuration_or_request": "model_unavailable",
+        }
         return (
             jsonify(
                 {
                     "verified": False,
-                    "message": (
-                        "No configured AI provider completed the connection check. "
-                        "Review the required key and model settings."
-                    ),
-                    "attempts": exc.attempts,
+                    "message": "No configured provider completed the connection check.",
+                    "attempts": attempts,
+                    "provider_results": [
+                        {
+                            "provider": item.get("provider"),
+                            "state": categories.get(item.get("category"), "connection_failed"),
+                        }
+                        for item in attempts
+                    ],
                 }
             ),
             503,
@@ -637,6 +980,7 @@ def check_provider_connection():
             "verified": True,
             "provider": result["provider"],
             "model": result["model"],
+            "attempts": result.get("attempts", []),
         }
     )
 

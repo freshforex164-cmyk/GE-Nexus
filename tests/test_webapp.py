@@ -15,6 +15,8 @@ class WebAppTests(unittest.TestCase):
     def setUp(self):
         self.client = webapp.app.test_client()
         webapp._limiter = webapp.SlidingWindowLimiter()
+        with webapp._research_contexts_lock:
+            webapp._research_contexts.clear()
 
     def test_health_and_status_do_not_expose_provider_secrets(self):
         secret = "do-not-return-this-provider-key"
@@ -37,7 +39,10 @@ class WebAppTests(unittest.TestCase):
         self.assertTrue(response.json["providers"][1]["model_configured"])
         self.assertFalse(response.json["providers"][1]["connection_verified"])
         self.assertFalse(response.json["provider_checks_are_live"])
-        self.assertFalse(response.json["analysis_history"]["persistent"])
+        self.assertEqual(
+            response.json["analysis_history"]["persistent"], "browser_local_storage"
+        )
+        self.assertFalse(response.json["analysis_history"]["server_database"])
         self.assertNotIn(secret, json.dumps(response.json))
 
     def test_render_requires_an_access_password(self):
@@ -47,7 +52,7 @@ class WebAppTests(unittest.TestCase):
             {"RENDER": "true", "GE_NEXUS_ACCESS_PASSWORD": "configured"}
         )
 
-    def test_configured_password_protects_app_but_not_health_check(self):
+    def test_app_remains_public_when_a_deployment_password_is_configured(self):
         password = "test-only-access-password"
         basic = base64.b64encode(
             ("ge-nexus:" + password).encode("utf-8")
@@ -62,9 +67,8 @@ class WebAppTests(unittest.TestCase):
             authorized_status = self.client.get(
                 "/api/status", headers={"Authorization": "Basic " + basic}
             )
-        self.assertEqual(page.status_code, 401)
-        self.assertIn("Basic", page.headers["WWW-Authenticate"])
-        self.assertEqual(status.status_code, 401)
+        self.assertEqual(page.status_code, 200)
+        self.assertEqual(status.status_code, 200)
         self.assertEqual(health.status_code, 200)
         self.assertEqual(authorized_page.status_code, 200)
         self.assertEqual(authorized_status.status_code, 200)
@@ -77,6 +81,8 @@ class WebAppTests(unittest.TestCase):
             "data": {
                 "created_by": "trader-scanner",
                 "source": "yahoo",
+                "universe": 1,
+                "scanned": 1,
                 "hits": [{"symbol": "AAPL", "setups": ["daily high"]}],
             },
         }
@@ -110,7 +116,7 @@ class WebAppTests(unittest.TestCase):
             "id": "a1",
             "tool": "scanner_daily",
             "status": "completed",
-            "data": {"created_by": "trader-scanner", "mode": "daily", "hits": []},
+            "data": {"created_by": "trader-scanner", "mode": "daily", "universe": 1, "scanned": 1, "hits": []},
         }
         with mock.patch.object(
             webapp, "_execute_validated_action", return_value=(expected, [])
@@ -127,7 +133,7 @@ class WebAppTests(unittest.TestCase):
     def test_scanner_auto_interprets_only_completed_tool_results(self):
         successful = {
             "id": "a1", "tool": "scanner_daily", "status": "completed",
-            "data": {"created_by": "trader-scanner", "mode": "daily", "hits": []},
+            "data": {"created_by": "trader-scanner", "mode": "daily", "universe": 1, "scanned": 1, "hits": []},
         }
         failed = {"id": "a1", "tool": "scanner_daily", "status": "failed"}
         interpretation = {
@@ -156,7 +162,8 @@ class WebAppTests(unittest.TestCase):
             response = self.client.post(
                 "/api/scanner", json={"mode": "daily", "symbols": ["AAPL"]}
             )
-        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["scan_summary"]["status"], "failed")
         interpret_failed.assert_not_called()
 
     def test_scanner_rejects_invalid_symbols_and_modes(self):
@@ -240,7 +247,7 @@ class WebAppTests(unittest.TestCase):
             response = self.client.post("/api/providers/check", json={})
         self.assertEqual(response.status_code, 503)
         self.assertFalse(response.json["verified"])
-        self.assertIn("model settings", response.json["message"])
+        self.assertEqual(response.json["attempts"][0]["category"], "missing_model")
 
     def test_analysis_route_calls_real_coordinator_contract(self):
         result = {
@@ -334,6 +341,103 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(worker.status_code, 200)
         self.assertEqual(worker.headers["Service-Worker-Allowed"], "/")
         self.assertEqual(api.headers["Cache-Control"], "no-store")
+
+    def test_auto_scan_uses_exchange_clock_and_avoids_unsupported_intraday_windows(self):
+        open_clock = {
+            "status": "completed",
+            "data": {
+                "calendar_known": True,
+                "open": True,
+                "now_new_york": "2026-10-19 10:15",
+                "opens": "09:30",
+                "closes": "16:00",
+            },
+        }
+        with mock.patch.object(
+            webapp, "_execute_validated_action", return_value=(open_clock, [])
+        ):
+            self.assertEqual(webapp._automatic_scan_mode()[0], "orb")
+        clocks_requiring_daily = (
+            {"status": "failed", "data": {}},
+            {"status": "completed", "data": {"calendar_known": True, "open": False}},
+            {"status": "completed", "data": {"calendar_known": False, "open": True}},
+            {
+                "status": "completed",
+                "data": {
+                    "calendar_known": True,
+                    "open": True,
+                    "now_new_york": "2026-10-19 09:40",
+                    "opens": "09:30",
+                    "closes": "16:00",
+                },
+            },
+        )
+        for clock in clocks_requiring_daily:
+            with mock.patch.object(
+                webapp, "_execute_validated_action", return_value=(clock, [])
+            ):
+                self.assertEqual(webapp._automatic_scan_mode()[0], "daily")
+
+    def test_research_question_uses_server_retained_python_evidence(self):
+        scan_result = {
+            "id": "a1",
+            "tool": "scanner_daily",
+            "status": "completed",
+            "data": {
+                "created_by": "trader-scanner",
+                "mode": "daily",
+                "universe": 1,
+                "scanned": 1,
+                "source": "yahoo",
+                "hits": [
+                    {"symbol": "AAPL", "setups": ["breakout_20d"], "price": 200.0}
+                ],
+            },
+        }
+        with mock.patch.object(
+            webapp, "_execute_validated_action", return_value=(scan_result, [])
+        ), mock.patch.object(
+            webapp, "_interpret_action", side_effect=lambda result, _text: result
+        ):
+            scan = self.client.post(
+                "/api/scanner", json={"mode": "daily", "symbols": ["AAPL"]}
+            )
+        self.assertEqual(scan.status_code, 200)
+        research_id = scan.json["research_id"]
+        self.assertTrue(research_id)
+
+        answer = {
+            "answer": "The result reports a 20-day breakout.",
+            "limitations": ["This is a research observation, not a recommendation."],
+            "provider": "OpenAI",
+            "model": "test-model",
+            "attempts": [],
+        }
+        with mock.patch.object(
+            webapp.coordinator, "answer_research_question", return_value=answer
+        ) as ask:
+            response = self.client.post(
+                "/api/research/ask",
+                json={"research_id": research_id, "question": "What did AAPL match?"},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["answer"], answer["answer"])
+        evidence = ask.call_args.args[1]
+        self.assertEqual(evidence["data"]["hits"][0]["symbol"], "AAPL")
+
+    def test_research_question_reports_expired_context_without_calling_ai(self):
+        with mock.patch.object(
+            webapp.coordinator, "answer_research_question"
+        ) as ask:
+            response = self.client.post(
+                "/api/research/ask",
+                json={"research_id": "A" * 32, "question": "What is the entry price?"},
+            )
+        self.assertEqual(response.status_code, 410)
+        self.assertEqual(
+            response.json["error"]["category"], "research_context_expired"
+        )
+        ask.assert_not_called()
 
 
 if __name__ == "__main__":
