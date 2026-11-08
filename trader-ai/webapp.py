@@ -43,6 +43,8 @@ MAX_RESEARCH_CONTEXTS = 80
 RESEARCH_CONTEXT_TTL = 60 * 60
 _research_contexts = OrderedDict()
 _research_contexts_lock = threading.Lock()
+_provider_checks = {}
+_provider_checks_lock = threading.Lock()
 
 
 def _validate_deployment_configuration(environ):
@@ -194,7 +196,8 @@ def _provider_status():
     providers = []
     for priority, spec in enumerate(coordinator.provider.PROVIDERS, start=1):
         has_key = bool(os.environ.get(spec.key_env, "").strip())
-        has_model = bool(os.environ.get(spec.model_env, "").strip())
+        model, model_source = coordinator.provider.selected_model(spec)
+        has_model = bool(model)
         endpoint = os.environ.get(spec.endpoint_env) or spec.endpoint
         try:
             coordinator.provider._validate_endpoint(endpoint)
@@ -202,6 +205,8 @@ def _provider_status():
         except ValueError:
             endpoint_valid = False
         configured = has_key and has_model and endpoint_valid
+        with _provider_checks_lock:
+            last_check = _provider_checks.get(spec.name)
         providers.append(
             {
                 "name": spec.name,
@@ -211,20 +216,53 @@ def _provider_status():
                 "endpoint_env": spec.endpoint_env,
                 "key_configured": has_key,
                 "model_configured": has_model,
+                "selected_model": model,
+                "model_source": model_source,
+                "provider_available": configured,
                 "configured": configured,
-                "connection_verified": False,
+                "connection_verified": (
+                    last_check.get("status") == "verified" if last_check else False
+                ),
+                "last_connection_result": last_check,
                 "state": (
-                    "configured"
+                    "misconfigured"
+                    if has_key and not endpoint_valid
+                    else "ready"
                     if configured
-                    else "invalid_endpoint"
-                    if has_key and has_model and not endpoint_valid
-                    else "model_missing"
-                    if has_key and not has_model
-                    else "needs_configuration"
+                    else "unavailable"
                 ),
             }
         )
     return providers
+
+
+def _remember_provider_check(attempts, verified_provider=None, verified_model=None):
+    """Keep only safe, non-secret results from the latest ordered connection test."""
+    checked_at = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    by_provider = {
+        item.get("provider"): item.get("category")
+        for item in attempts
+        if isinstance(item, dict)
+    }
+    if verified_provider:
+        by_provider[verified_provider] = "verified"
+    with _provider_checks_lock:
+        for spec in coordinator.provider.PROVIDERS:
+            category = by_provider.get(spec.name)
+            if category is None:
+                status = "not_attempted"
+            elif category == "verified":
+                status = "verified"
+            elif category == "missing_key":
+                status = "unavailable"
+            else:
+                status = "failed"
+            result = {"status": status, "checked_at": checked_at}
+            if category and category != "verified":
+                result["category"] = category
+            if status == "verified" and verified_model:
+                result["model"] = verified_model
+            _provider_checks[spec.name] = result
 
 
 def _has_regular_runtime_file(name):
@@ -325,6 +363,13 @@ def _scan_summary(result, requested_symbols, mode):
     hits = data.get("hits") if isinstance(data.get("hits"), list) else []
     requested = int(data.get("universe") or len(requested_symbols))
     analyzed = int(data.get("scanned") or counts.get("scanned") or 0)
+    symbol_results = data.get("symbol_results")
+    if isinstance(symbol_results, list):
+        analyzed = sum(
+            1 for item in symbol_results
+            if isinstance(item, dict)
+            and item.get("status") in ("completed", "no_qualifying_result")
+        )
     errors = max(0, int(data.get("failed") or 0))
     unconfirmed = max(0, int(data.get("unconfirmed") or counts.get("unconfirmed") or 0))
     failed_symbols = data.get("failed_symbols")
@@ -334,6 +379,19 @@ def _scan_summary(result, requested_symbols, mode):
         symbol for symbol in failed_symbols
         if isinstance(symbol, str) and TICKER_RE.fullmatch(symbol)
     ][:MAX_SYMBOLS]
+    if isinstance(symbol_results, list):
+        detailed_failures = [
+            item.get("symbol") for item in symbol_results
+            if isinstance(item, dict)
+            and item.get("status") in (
+                "no_market_data", "unsupported_symbol", "temporarily_unavailable",
+                "analysis_error", "analysis_incomplete",
+            )
+            and isinstance(item.get("symbol"), str)
+            and TICKER_RE.fullmatch(item["symbol"])
+        ]
+        failed_symbols = list(dict.fromkeys(failed_symbols + detailed_failures))[:MAX_SYMBOLS]
+        errors = max(errors, len(detailed_failures))
     if result.get("status") != "completed":
         state = "failed"
         label = "Scan failed"
@@ -420,6 +478,85 @@ def _structure_scan_result(result, requested_symbols, mode):
     data = result.get("data") if isinstance(result.get("data"), dict) else {}
     summary = _scan_summary(result, requested_symbols, mode)
     findings = _research_findings(data)
+    raw_results = data.get("symbol_results")
+    if not isinstance(raw_results, list):
+        raw_results = []
+    by_symbol = {
+        item.get("symbol"): item
+        for item in raw_results
+        if isinstance(item, dict)
+        and isinstance(item.get("symbol"), str)
+        and TICKER_RE.fullmatch(item["symbol"])
+    }
+    findings_by_symbol = {item["symbol"]: item for item in findings}
+    normalized_results = []
+    failed_symbols = set(summary["data_error_symbols"])
+    for symbol in requested_symbols:
+        raw = by_symbol.get(symbol, {})
+        finding = findings_by_symbol.get(symbol)
+        status = raw.get("status")
+        if status not in {
+            "completed", "no_qualifying_result", "no_market_data",
+            "unsupported_symbol", "temporarily_unavailable",
+            "analysis_error", "analysis_incomplete",
+        }:
+            if result.get("status") != "completed":
+                status = "analysis_error"
+            elif finding:
+                status = "completed"
+            elif symbol in failed_symbols:
+                status = "no_market_data"
+            elif summary["instruments_analyzed"] > 0:
+                status = "no_qualifying_result"
+            else:
+                status = "no_market_data"
+        reason = raw.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            reason = (
+                "The existing scanner returned a qualifying pattern."
+                if finding
+                else "The existing scanner returned no qualifying pattern."
+                if status == "no_qualifying_result"
+                else "The existing scanner did not return usable data for this symbol."
+            )
+        directional = "WAIT" if status == "no_qualifying_result" else (
+            "NO RESULT" if status in {
+                "no_market_data", "unsupported_symbol", "temporarily_unavailable",
+                "analysis_error", "analysis_incomplete",
+            } else None
+        )
+        normalized_results.append(
+            {
+                "symbol": symbol,
+                "analysis_status": status,
+                "assessment": directional,
+                "assessment_note": (
+                    "A scanner finding is not a BUY or SELL signal."
+                    if finding else None
+                ),
+                "market_price": raw.get("price", finding.get("price") if finding else None),
+                "entry_price": None,
+                "stop_loss": None,
+                "take_profit": None,
+                "risk": None,
+                "position_size": None,
+                "timeframe": raw.get("timeframe") or data.get("interval") or (
+                    "1d" if mode == "daily" else "5m"
+                ),
+                "analysis_timestamp": data.get("created_at"),
+                "price_as_of": raw.get("price_as_of") or (
+                    finding.get("price_as_of") if finding else data.get("as_of")
+                ),
+                "reasons": [reason],
+                "warnings": (
+                    [reason] if status in {
+                        "no_market_data", "unsupported_symbol", "temporarily_unavailable",
+                        "analysis_error", "analysis_incomplete",
+                    } else []
+                ),
+                "tool_result": finding,
+            }
+        )
     explanation = [
         (
             "Daily mode checks completed daily closes for 20-day breakouts, bull-flag patterns, "
@@ -436,6 +573,7 @@ def _structure_scan_result(result, requested_symbols, mode):
     ]
     result["scan_summary"] = summary
     result["research_findings"] = findings
+    result["symbol_results"] = normalized_results
     result["research_explanation"] = explanation
     return result
 
@@ -952,8 +1090,8 @@ def check_provider_connection():
         )
     except coordinator.provider.ProviderUnavailable as exc:
         attempts = exc.attempts
+        _remember_provider_check(attempts)
         categories = {
-            "missing_model": "model_missing",
             "missing_key": "unavailable",
             "authentication": "connection_failed",
             "model_unavailable": "model_unavailable",
@@ -982,6 +1120,11 @@ def check_provider_connection():
             ),
             503,
         )
+    _remember_provider_check(
+        result.get("attempts", []),
+        verified_provider=result["provider"],
+        verified_model=result["model"],
+    )
     return jsonify(
         {
             "verified": True,

@@ -28,6 +28,11 @@
     latestResearch: null,
     scanInput: "",
     scanError: null,
+    scanResult: null,
+    scanBusy: false,
+    scanController: null,
+    scanSymbolCount: 0,
+    scanMessage: "",
     instrumentSymbol: "",
     instrumentResult: null,
     instrumentError: null,
@@ -78,19 +83,47 @@
   };
 
   async function api(url, options = {}) {
+    const timeoutMs = options.timeoutMs || 30000;
+    const { timeoutMs: _ignoredTimeout, signal: externalSignal, ...fetchOptions } = options;
+    const controller = new AbortController();
+    let timedOut = false;
+    let timeoutId = null;
+    const abortFromCaller = () => controller.abort();
+    if (externalSignal) {
+      if (externalSignal.aborted) controller.abort();
+      else externalSignal.addEventListener("abort", abortFromCaller, { once: true });
+    }
+    timeoutId = window.setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
     let response;
     try {
       response = await fetch(url, {
-        ...options,
+        ...fetchOptions,
         credentials: "same-origin",
         cache: "no-store",
+        signal: controller.signal,
         headers: { Accept: "application/json", ...(options.body ? { "Content-Type": "application/json" } : {}), ...options.headers }
       });
     } catch (cause) {
+      window.clearTimeout(timeoutId);
+      externalSignal?.removeEventListener("abort", abortFromCaller);
+      if (controller.signal.aborted) {
+        const error = new Error(timedOut
+          ? `The request timed out after ${Math.ceil(timeoutMs / 1000)} seconds.`
+          : "The request was cancelled.");
+        error.name = timedOut ? "TimeoutError" : "AbortError";
+        error.url = url;
+        throw error;
+      }
       const error = new Error("The local research service could not be reached.");
       error.cause = cause;
       error.url = url;
       throw error;
+    } finally {
+      window.clearTimeout(timeoutId);
+      externalSignal?.removeEventListener("abort", abortFromCaller);
     }
     let data;
     try { data = await response.json(); } catch { data = null; }
@@ -216,12 +249,18 @@
         String(state.providerTest.provider || "").toLowerCase() === name) {
       return { text: "Ready", className: "verified" };
     }
+    const last = provider.last_connection_result;
+    if (last?.status === "verified") return { text: "Provider verified", className: "verified" };
+    if (last?.status === "failed") return { text: "Last check failed", className: "failed" };
+    if (provider.state === "misconfigured") return { text: "Misconfigured", className: "failed" };
+    if (provider.state === "unavailable" || !provider.key_configured) {
+      return { text: "Unavailable · key missing", className: "needs" };
+    }
     const tested = (state.providerTest?.attempts || []).find(
       (attempt) => String(attempt.provider || "").toLowerCase() === name
     );
     if (tested) {
       const states = {
-        missing_model: ["Model missing", "needs"],
         missing_key: ["Unavailable", "needs"],
         authentication: ["Authentication failed", "failed"],
         model_unavailable: ["Model unavailable", "failed"],
@@ -236,10 +275,7 @@
       const [text, className] = states[tested.category] || ["Connection failed", "failed"];
       return { text, className };
     }
-    if (provider.state === "invalid_endpoint") return { text: "Connection failed", className: "failed" };
-    if (provider.key_configured && !provider.model_configured) return { text: "Model missing", className: "needs" };
-    if (!provider.key_configured) return { text: "Unavailable", className: "needs" };
-    return { text: "Configured", className: "" };
+    return { text: "Ready to test", className: "" };
   }
 
   function providerRows(providers = []) {
@@ -247,12 +283,17 @@
     return providers.map((provider) => {
       const setup = providerStatus(provider);
       const endpoint = provider.endpoint || provider.base_url || provider.api_base || null;
+      const last = provider.last_connection_result;
+      const lastResult = last
+        ? `Last check: ${last.status.replaceAll("_", " ")}${last.checked_at ? ` · ${shortDate(last.checked_at)}` : ""}${last.category ? ` (${last.category.replaceAll("_", " ")})` : ""}`
+        : "Not tested yet · Settings do not make a provider request";
       return `<article class="config-row">
-        <div><strong>${esc(provider.name || "Provider")}</strong><small>${provider.key_configured ? "Key present" : "Key missing"} · ${provider.model_configured ? "Model set" : "Model missing"}</small></div>
+        <div><strong>${esc(provider.name || "Provider")}</strong><small>${provider.key_configured ? "API key present" : "API key missing"} · Model ${esc(provider.selected_model || "not configured")} (${provider.model_source === "override" ? "override" : "default"})</small><small>${esc(lastResult)}</small></div>
         <span class="badge ${setup.className}">${esc(setup.text)}</span>
         <details class="details-block provider-details"><summary>Technical details</summary><pre>${esc(safeJson({
           key_variable: provider.key_env,
           model_variable: provider.model_env,
+          model_source: provider.model_source,
           endpoint_variable: provider.endpoint_env,
           endpoint: endpoint
         }))}</pre></details>
@@ -358,6 +399,49 @@
     }).join("")}</div>`;
   }
 
+  function symbolResultsMarkup(result) {
+    const rows = Array.isArray(result?.symbol_results) ? result.symbol_results : [];
+    if (!rows.length) return '<div class="empty-state"><p>No per-symbol details were returned.</p></div>';
+    const bySymbol = new Map(rows.map((row) => [row.symbol, row]));
+    const ranked = (result?.research_findings || [])
+      .map((finding) => bySymbol.get(finding.symbol))
+      .filter(Boolean);
+    const rankedSymbols = new Set(ranked.map((row) => row.symbol));
+    const ordered = [...ranked, ...rows.filter((row) => !rankedSymbols.has(row.symbol))];
+    const labels = {
+      completed: ["Research finding", "verified"],
+      no_qualifying_result: ["WAIT · no qualifying setup", ""],
+      no_market_data: ["NO RESULT · data unavailable", "failed"],
+      unsupported_symbol: ["NO RESULT · unsupported symbol", "failed"],
+      temporarily_unavailable: ["NO RESULT · temporarily unavailable", "failed"],
+      analysis_error: ["NO RESULT · analysis failed", "failed"],
+      analysis_incomplete: ["Not fully checked", "needs"]
+    };
+    return `<div class="finding-grid">${ordered.map((row) => {
+      const [label, badgeClass] = labels[row.analysis_status] || ["NO RESULT", "failed"];
+      const finding = row.tool_result;
+      const displayFinding = (result?.research_findings || []).find((item) => item.symbol === row.symbol);
+      const facts = [
+        row.market_price != null ? ["Latest available price", formatPrice(row.market_price)] : null,
+        row.entry_price != null ? ["Entry", formatPrice(row.entry_price)] : null,
+        row.stop_loss != null ? ["Stop", formatPrice(row.stop_loss)] : null,
+        row.take_profit != null ? ["Target", formatPrice(row.take_profit)] : null,
+        row.timeframe ? ["Timeframe", row.timeframe] : null,
+        row.price_as_of || row.analysis_timestamp
+          ? ["Data time", row.price_as_of || row.analysis_timestamp] : null
+      ].filter(Boolean);
+      const setups = (displayFinding?.setups || []).map((setup) => setup.label);
+      return `<article class="finding-card">
+        <div class="finding-top"><div><p class="section-kicker">Instrument</p><h4>${esc(row.symbol)}</h4></div><span class="badge ${badgeClass}">${esc(label)}</span></div>
+        ${row.assessment_note ? `<p class="muted-detail">${esc(row.assessment_note)}</p>` : ""}
+        ${setups.length ? `<div class="finding-tags">${setups.map((setup) => `<span class="finding-tag">${esc(setup)}</span>`).join("")}</div>` : ""}
+        ${facts.length ? `<div class="finding-facts">${facts.map(([name, value]) => `<div><span>${esc(name)}</span><strong>${esc(value)}</strong></div>`).join("")}</div>` : ""}
+        ${(row.reasons || []).length ? `<ul class="result-list finding-explanations">${row.reasons.map((reason) => `<li>${esc(reason)}</li>`).join("")}</ul>` : ""}
+        ${row.warnings?.length ? `<p class="finding-source">${esc(row.warnings.join(" · "))}</p>` : ""}
+      </article>`;
+    }).join("")}</div>`;
+  }
+
   function scanOutput(result, index = "") {
     const data = result?.data || {};
     const summary = result?.scan_summary || {};
@@ -381,9 +465,10 @@
         ${summary.status === "partial" ? `<div class="notice warning">${icon("info")}<span>Some instruments could not be checked${summary.unconfirmed_candidates ? `; ${esc(summary.unconfirmed_candidates)} possible candidates were not fully confirmed` : ""}. Counts reflect the scanner's actual response.</span></div>` : ""}
         ${summary.data_error_symbols?.length ? `<div class="notice warning">${icon("info")}<span>No data was returned for: ${esc(summary.data_error_symbols.join(", "))}. The scanner does not assume these symbols are supported or fabricate a result.</span></div>` : ""}
         ${result.scan_mode_reason ? `<p class="muted-detail">${esc(result.scan_mode_reason)}</p>` : ""}
-        <h4 class="result-section">Research findings</h4>${findingCards(result)}
+        <h4 class="result-section">Symbol-by-symbol results</h4>${symbolResultsMarkup(result)}
+        ${summary.candidate_count ? `<h4 class="result-section">Qualifying findings · scanner order</h4>${findingCards(result)}` : ""}
         <h4 class="result-section">What the scan checks</h4><ul class="result-list">${explanations || "<li>The scanner did not return an explanation.</li>"}</ul>
-        ${researchQuestionForm(result)}
+        <details class="details-block optional-ai"><summary>Optional AI explanation</summary>${researchQuestionForm(result)}</details>
         ${rawDetails("Technical details", result)}
       </div>
     </section>${interpretationPanel(result)}`;
@@ -395,15 +480,19 @@
 
   function scanForm(id, title) {
     const symbols = state.scanInput || savedSymbols();
+    const progress = state.scanBusy
+      ? `<div class="scan-progress-wrap"><progress aria-label="Market scan in progress"></progress><span>Analyzing ${esc(state.scanSymbolCount)} instruments in one rate-limited scanner batch. Per-symbol progress is available when the batch returns.</span></div>`
+      : "";
     return `<section class="panel scan-controls" aria-labelledby="${id}-heading">
       <p class="section-kicker">Market research</p><h2 id="${id}-heading">${esc(title)}</h2>
       <p class="form-intro">GE Nexus picks the right scan for the current market session.</p>
       <form id="${id}">
         <input type="hidden" name="mode" value="auto">
-        <div class="scan-inline"><div class="form-field"><label for="${id}-symbols">Tickers</label><input class="text-input" id="${id}-symbols" name="symbols" value="${esc(symbols)}" autocomplete="off" placeholder="Use your saved defaults" aria-describedby="${id}-help"><p class="field-help" id="${id}-help">Comma-separated · up to ${esc(state.universe?.max_symbols || 20)} U.S.-listed equity symbols.</p></div><button class="button" type="submit" data-scan-submit>${icon("scan")} Start Market Scan</button></div>
-        <p class="form-status" data-scan-status role="status" aria-live="polite"></p>
+        <div class="scan-inline"><div class="form-field"><label for="${id}-symbols">Tickers</label><input class="text-input" id="${id}-symbols" name="symbols" value="${esc(symbols)}" autocomplete="off" placeholder="Use your saved defaults" aria-describedby="${id}-help"><p class="field-help" id="${id}-help">Comma-separated · up to ${esc(state.universe?.max_symbols || 20)} U.S.-listed equity symbols.</p></div><button class="button" type="submit" data-scan-submit ${state.scanBusy ? "disabled" : ""}>${icon("scan")} ${state.scanBusy ? "Scanning…" : "Start Market Scan"}</button><button class="button button-secondary" type="button" data-cancel-scan ${state.scanBusy ? "" : "hidden"}>Cancel scan</button></div>
+        ${progress}
+        <p class="form-status" data-scan-status role="status" aria-live="polite">${esc(state.scanMessage)}</p>
       </form>
-      <div data-scan-result aria-live="polite">${state.scanError ? errorPanel("Scan could not complete", state.scanError, "data-retry-scan") : ""}</div>
+      <div data-scan-result aria-live="polite">${state.scanBusy ? '<div class="skeleton skeleton-h14 skeleton-w83 skeleton-gap12"></div>' : state.scanResult ? scanOutput(state.scanResult) : state.scanError ? errorPanel("Scan could not complete", state.scanError, "data-retry-scan") : ""}</div>
     </section>`;
   }
 
@@ -600,42 +689,55 @@
   }
 
   async function submitScan(form) {
+    if (state.scanBusy) return;
     const mode = new FormData(form).get("mode");
     const input = form.querySelector('[name="symbols"]').value.trim();
     state.scanInput = input;
     const symbols = input ? formSymbols(input) : [];
-    const statusNode = form.querySelector("[data-scan-status]");
-    const resultNode = form.querySelector("[data-scan-result]");
-    const submit = form.querySelector("[data-scan-submit]");
     const validation = input ? symbolsError(parseSymbols(input)) : "";
     if (validation) {
-      statusNode.textContent = validation;
+      state.scanMessage = validation;
+      render();
       form.querySelector('[name="symbols"]').focus();
       return;
     }
-    submit.disabled = true;
-    statusNode.textContent = "Running your market scan…";
-    resultNode.innerHTML = `<section class="panel result-panel"><div class="result-top"><div><h3>Scan in progress</h3><p>Checking available market data.</p></div></div><div class="result-content"><div class="skeleton skeleton-h14 skeleton-w50"></div><div class="skeleton skeleton-h14 skeleton-w83 skeleton-gap12"></div></div></section>`;
+    const effectiveSymbols = symbols.length
+      ? symbols
+      : (state.universe?.default_symbols || ["AAPL", "AMZN", "GOOGL", "META", "MSFT", "NVDA", "TSLA"]);
+    state.scanBusy = true;
+    state.scanSymbolCount = effectiveSymbols.length;
+    state.scanController = new AbortController();
+    state.scanMessage = `Submitting ${effectiveSymbols.length} instruments to the existing scanner.`;
     state.scanError = null;
+    state.scanResult = null;
+    render();
     try {
-      const payload = { mode };
-      if (symbols.length) payload.symbols = symbols;
-      const result = await api(API.scanner, { method: "POST", body: JSON.stringify(payload) });
+      const payload = { mode, symbols: effectiveSymbols };
+      const result = await api(API.scanner, {
+        method: "POST",
+        body: JSON.stringify(payload),
+        timeoutMs: 120000,
+        signal: state.scanController.signal
+      });
       const stored = persistResearchResult(result, "scan");
       state.latestResearch = result;
       state.scanError = null;
+      state.scanResult = result;
       state.scanInput = input;
-      statusNode.textContent = result.status !== "completed"
+      state.scanMessage = result.status !== "completed"
         ? (result.scan_summary?.label || "The scan could not complete.")
         : `${result.scan_summary?.label || "Scan returned"}${stored ? " · Saved in this browser." : " · Browser storage was unavailable."}`;
-      resultNode.innerHTML = scanOutput(result);
-      render();
     } catch (error) {
       state.scanError = error;
-      statusNode.textContent = "The scan did not return a result.";
-      resultNode.innerHTML = errorPanel("Scan could not complete", error, "data-retry-scan");
+      state.scanMessage = error.name === "AbortError"
+        ? "Scan cancelled. No partial result was returned."
+        : error.name === "TimeoutError"
+          ? "The scan timed out. Try fewer symbols or retry later."
+          : "The scan did not return a result.";
     } finally {
-      if (submit.isConnected) submit.disabled = false;
+      state.scanBusy = false;
+      state.scanController = null;
+      render();
     }
   }
 
@@ -714,6 +816,7 @@
       state.providerTestError = error;
     } finally {
       state.providerTestBusy = false;
+      try { state.status = await api(API.status); } catch { /* Keep the latest visible status if refresh fails. */ }
       if (state.route === "settings") renderSettings();
     }
   }

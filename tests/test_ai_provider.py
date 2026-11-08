@@ -110,7 +110,6 @@ class ProviderTests(unittest.TestCase):
             [{"role": "user", "content": "Analyze TSLA"}],
             environ={
                 "DEEPSEEK_API_KEY": "deepseek-test-secret",
-                "DEEPSEEK_MODEL": "deepseek-test",
             },
             post_json=lambda *args: calls.append(args) or completion("ok"),
         )
@@ -121,44 +120,53 @@ class ProviderTests(unittest.TestCase):
             ["missing_key", "missing_key", "missing_key"],
         )
 
-    def test_missing_model_configuration_skips_provider_without_network_call(self):
+    def test_provider_defaults_are_used_without_model_environment_values(self):
         calls = []
+        env = {spec.key_env: "test-key" for spec in provider.PROVIDERS}
 
-        def fail_first_provider(url, headers, payload, timeout):
-            calls.append(url)
-            raise provider.ProviderHTTPError(503)
+        def post(url, headers, payload, timeout):
+            calls.append(payload)
+            return completion("default model response")
 
-        with self.assertRaises(provider.ProviderUnavailable) as context:
-            provider.chat_completion(
-                [{"role": "user", "content": "Analyze TSLA"}],
-                environ={
-                    "OPENROUTER_API_KEY": "router-test-secret",
-                    "OPENROUTER_MODEL": "openai/gpt-4",
-                    "OPENAI_API_KEY": "openai-test-secret",
-                },
-                post_json=fail_first_provider,
-            )
-        self.assertEqual(len(calls), 1)
-        attempts = context.exception.as_dict()["attempts"]
-        self.assertEqual(attempts[0], {
-            "provider": "OpenRouter", "category": "server_error"
-        })
-        self.assertEqual(attempts[1], {
-            "provider": "OpenAI", "category": "missing_model"
-        })
-
-    def test_openrouter_without_model_is_skipped(self):
-        env = configured()
-        env.pop("OPENROUTER_MODEL")
-        calls = []
         result = provider.chat_completion(
             [{"role": "user", "content": "Analyze TSLA"}],
             environ=env,
-            post_json=lambda *args: calls.append(args) or completion("openai response"),
+            post_json=post,
+        )
+        self.assertEqual(result["provider"], "OpenRouter")
+        self.assertEqual(result["model"], "openai/gpt-5.4-mini")
+        self.assertEqual(calls[0]["model"], provider.PROVIDERS[0].default_model)
+
+    def test_optional_model_override_wins_over_provider_default(self):
+        env = {"OPENROUTER_API_KEY": "test-key", "OPENROUTER_MODEL": "custom/model"}
+        result = provider.chat_completion(
+            [{"role": "user", "content": "Check this result"}],
+            environ=env,
+            post_json=lambda *args: completion("ok"),
+        )
+        self.assertEqual(result["model"], "custom/model")
+
+    def test_unavailable_default_model_falls_back_to_next_provider(self):
+        env = {
+            "OPENROUTER_API_KEY": "router-key",
+            "OPENAI_API_KEY": "openai-key",
+        }
+        calls = []
+
+        def post(url, headers, payload, timeout):
+            calls.append(payload["model"])
+            if len(calls) == 1:
+                raise provider.ProviderHTTPError(404)
+            return completion("fallback")
+
+        result = provider.chat_completion(
+            [{"role": "user", "content": "Check this result"}],
+            environ=env,
+            post_json=post,
         )
         self.assertEqual(result["provider"], "OpenAI")
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(result["attempts"][0]["category"], "missing_model")
+        self.assertEqual(calls, ["openai/gpt-5.4-mini", "gpt-5.4-mini"])
+        self.assertEqual(result["attempts"][0]["category"], "model_unavailable")
 
     def test_all_provider_failures_return_safe_structured_error(self):
         secret = "do-not-display-this-key"

@@ -37,6 +37,8 @@ class WebAppTests(unittest.TestCase):
         self.assertTrue(response.json["providers"][1]["configured"])
         self.assertTrue(response.json["providers"][1]["key_configured"])
         self.assertTrue(response.json["providers"][1]["model_configured"])
+        self.assertEqual(response.json["providers"][1]["selected_model"], "unit-test-model")
+        self.assertEqual(response.json["providers"][1]["model_source"], "override")
         self.assertFalse(response.json["providers"][1]["connection_verified"])
         self.assertFalse(response.json["provider_checks_are_live"])
         self.assertEqual(
@@ -58,9 +60,21 @@ class WebAppTests(unittest.TestCase):
         ):
             response = self.client.get("/api/status")
         provider = response.json["providers"][0]
-        self.assertEqual(provider["state"], "invalid_endpoint")
+        self.assertEqual(provider["state"], "misconfigured")
         self.assertFalse(provider["configured"])
         self.assertNotIn(secret, json.dumps(response.json))
+
+    def test_provider_status_uses_default_model_without_live_request(self):
+        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}, clear=True):
+            response = self.client.get("/api/status")
+        provider = response.json["providers"][0]
+        self.assertEqual(provider["selected_model"], "openai/gpt-5.4-mini")
+        self.assertEqual(provider["model_source"], "default")
+        self.assertTrue(provider["model_configured"])
+        self.assertTrue(provider["configured"])
+        self.assertFalse(provider["connection_verified"])
+        self.assertIsNone(provider["last_connection_result"])
+        self.assertFalse(response.json["provider_checks_are_live"])
 
     def test_render_requires_an_access_password(self):
         with self.assertRaisesRegex(RuntimeError, "GE_NEXUS_ACCESS_PASSWORD"):
@@ -376,7 +390,7 @@ class WebAppTests(unittest.TestCase):
         )
 
         unavailable = webapp.coordinator.provider.ProviderUnavailable(
-            [{"provider": "OpenRouter", "category": "missing_model"}]
+            [{"provider": "OpenRouter", "category": "missing_key"}]
         )
         with mock.patch.object(
             webapp.coordinator.provider, "chat_completion", side_effect=unavailable
@@ -384,7 +398,20 @@ class WebAppTests(unittest.TestCase):
             response = self.client.post("/api/providers/check", json={})
         self.assertEqual(response.status_code, 503)
         self.assertFalse(response.json["verified"])
-        self.assertEqual(response.json["attempts"][0]["category"], "missing_model")
+        self.assertEqual(response.json["attempts"][0]["category"], "missing_key")
+        status = self.client.get("/api/status").json["providers"][0]
+        self.assertEqual(status["last_connection_result"]["status"], "unavailable")
+
+    def test_provider_status_records_verified_result_after_connection_check(self):
+        with mock.patch.object(
+            webapp.coordinator.provider, "chat_completion",
+            return_value={"provider": "OpenAI", "model": "gpt-5.4-mini", "content": "OK", "attempts": []},
+        ):
+            response = self.client.post("/api/providers/check", json={})
+        self.assertEqual(response.status_code, 200)
+        provider_status = self.client.get("/api/status").json["providers"][1]
+        self.assertEqual(provider_status["last_connection_result"]["status"], "verified")
+        self.assertEqual(provider_status["last_connection_result"]["model"], "gpt-5.4-mini")
 
     def test_provider_health_check_requires_the_expected_reply(self):
         self.assertEqual(webapp._validate_provider_check_response(" OK\n"), "OK")

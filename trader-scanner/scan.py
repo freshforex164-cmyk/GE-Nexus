@@ -539,13 +539,18 @@ def find_setups(closes):
                   "run_pct": run * 100, "range5_pct": rng5 * 100}
 
 
-def scan_daily(data, symbols, now_utc, min_price, min_volume):
+def scan_daily(data, symbols, now_utc, min_price, min_volume, symbol_results=None):
     """Pure. data = {SYM: series}. Returns (hits, counts, last_date)."""
     hits, dates = [], {}
+    details = symbol_results if symbol_results is not None else {}
     counts = {"requested": len(symbols), "fetched": 0, "illiquid": 0, "short": 0, "scanned": 0}
     for sym in symbols:
         s = data.get(sym)
         if not s:
+            details[sym] = {
+                "symbol": sym, "status": "no_market_data",
+                "reason": "The data source did not return a chart for this symbol.",
+            }
             continue
         counts["fetched"] += 1
         bars = daily_closes(s, now_utc)
@@ -554,21 +559,61 @@ def scan_daily(data, symbols, now_utc, min_price, min_volume):
         if price is None and bars:
             price = bars[-1][1]
         vol = meta.get("regularMarketVolume")
-        if price is None or price < min_price or (min_volume > 0 and (vol is None or vol < min_volume)):
+        if price is None:
             counts["illiquid"] += 1
+            details[sym] = {
+                "symbol": sym, "status": "no_market_data",
+                "reason": "The chart did not contain a usable reference price.",
+                "timeframe": "1d",
+            }
+            continue
+        if price < min_price or (min_volume > 0 and (vol is None or vol < min_volume)):
+            counts["illiquid"] += 1
+            details[sym] = {
+                "symbol": sym, "status": "no_qualifying_result",
+                "reason": "The chart did not meet the scanner's configured price or volume filters.",
+                "price": round(float(price), 2),
+                "price_as_of": bars[-1][0].isoformat() if bars else None,
+                "volume": int(vol) if vol is not None else None,
+                "timeframe": "1d",
+            }
             continue
         if len(bars) < MIN_DAILY_BARS:
             counts["short"] += 1
+            details[sym] = {
+                "symbol": sym, "status": "no_market_data",
+                "reason": "There are not enough completed daily bars for the existing analysis.",
+                "price": round(float(price), 2),
+                "price_as_of": bars[-1][0].isoformat() if bars else None,
+                "volume": int(vol) if vol is not None else None,
+                "timeframe": "1d",
+            }
             continue
         counts["scanned"] += 1
         d_last = bars[-1][0]
         dates[d_last] = dates.get(d_last, 0) + 1
         closes = [c for _, c in bars]
         tags, nums = find_setups(closes)
+        hit = None
         if tags:
-            hits.append({"symbol": sym, "setups": tags, "price": round(closes[-1], 2),
-                         "close_date": d_last.isoformat(), "rsi": round(nums["rsi"], 1),
-                         "volume": int(vol) if vol is not None else None})
+            hit = {"symbol": sym, "setups": tags, "price": round(closes[-1], 2),
+                   "close_date": d_last.isoformat(), "rsi": round(nums["rsi"], 1),
+                   "volume": int(vol) if vol is not None else None}
+            hits.append(hit)
+        details[sym] = {
+            "symbol": sym,
+            "status": "completed" if hit else "no_qualifying_result",
+            "reason": (
+                "The existing daily-close rules found a setup."
+                if hit else "The existing daily-close rules found no qualifying setup."
+            ),
+            "price": round(closes[-1], 2),
+            "price_as_of": d_last.isoformat(),
+            "rsi_14": round(nums["rsi"], 1) if nums["rsi"] is not None else None,
+            "volume": int(vol) if vol is not None else None,
+            "timeframe": "1d",
+            "finding": hit,
+        }
     hits.sort(key=lambda h: (-(h["price"] * (h["volume"] or 0)), h["symbol"]))  # most dollars traded first
     last_date = max(dates, key=lambda d: (dates[d], d)) if dates else None
     counts["hits"] = len(hits)
@@ -684,7 +729,7 @@ def orb_window(now_utc, at, or_minutes, until, explicit_day=None):
 
 
 def scan_orb(stage1, symbols, day, cutoff, or_minutes, min_price=0.0, min_volume=0, confirm=None,
-             max_confirm=None):
+             max_confirm=None, symbol_results=None):
     """stage1 = {SYM: series} with closes (spark or v8). confirm(sym) -> series with highs/lows
     (None = use the stage-1 series). With confirm and max_confirm, only the max_confirm most
     traded candidates (price x volume so far) are confirmed; the rest are counted as unconfirmed.
@@ -693,26 +738,62 @@ def scan_orb(stage1, symbols, day, cutoff, or_minutes, min_price=0.0, min_volume
     counts = {"requested": len(symbols), "fetched": 0, "unusable": 0, "illiquid": 0, "scanned": 0,
               "candidates": 0, "confirmed": 0, "unconfirmed": 0}
     hits, failed, cands = [], {}, []
+    details = symbol_results if symbol_results is not None else {}
     for sym in symbols:
         s = stage1.get(sym)
         if not s:
+            details[sym] = {
+                "symbol": sym, "status": "no_market_data",
+                "reason": "The data source did not return an opening-range chart.",
+                "timeframe": "%dm" % BAR_MIN,
+            }
             continue
         counts["fetched"] += 1
         bars = session_bars(s, day, cutoff)
         if not usable(bars, day, cutoff, n_range):
             counts["unusable"] += 1
+            details[sym] = {
+                "symbol": sym, "status": "no_market_data",
+                "reason": "Completed bars were missing or insufficient for the configured session window.",
+                "timeframe": "%dm" % BAR_MIN,
+            }
             continue
         vol = sum(b["v"] for b in bars) if s.get("v") else (s.get("meta") or {}).get("regularMarketVolume") or 0
         if bars[-1]["c"] < min_price or vol < min_volume:
             counts["illiquid"] += 1
+            details[sym] = {
+                "symbol": sym, "status": "no_qualifying_result",
+                "reason": "The chart did not meet the scanner's configured price or volume filters.",
+                "price": round(bars[-1]["c"], 2),
+                "price_as_of": bars[-1]["start"].strftime("%Y-%m-%d %H:%M ET"),
+                "volume": int(vol),
+                "timeframe": "%dm" % BAR_MIN,
+            }
             continue
         counts["scanned"] += 1
         if orb_candidate(bars, n_range):
             cands.append((sym, bars, bars[-1]["c"] * vol))
+        else:
+            details[sym] = {
+                "symbol": sym, "status": "no_qualifying_result",
+                "reason": "No completed bar met the existing opening-range candidate condition.",
+                "price": round(bars[-1]["c"], 2),
+                "price_as_of": bars[-1]["start"].strftime("%Y-%m-%d %H:%M ET"),
+                "volume": int(vol),
+                "timeframe": "%dm" % BAR_MIN,
+            }
     counts["candidates"] = len(cands)
     if confirm is not None and max_confirm and len(cands) > max_confirm:
         cands.sort(key=lambda x: -x[2])
         counts["unconfirmed"] = len(cands) - max_confirm
+        for sym, bars, _turnover in cands[max_confirm:]:
+            details[sym] = {
+                "symbol": sym, "status": "analysis_incomplete",
+                "reason": "The scanner's existing confirmation limit left this candidate unchecked.",
+                "price": round(bars[-1]["c"], 2),
+                "price_as_of": bars[-1]["start"].strftime("%Y-%m-%d %H:%M ET"),
+                "timeframe": "%dm" % BAR_MIN,
+            }
         cands = cands[:max_confirm]
     for sym, bars, _ in cands:
         full = bars
@@ -721,15 +802,39 @@ def scan_orb(stage1, symbols, day, cutoff, or_minutes, min_price=0.0, min_volume
                 s2 = confirm(sym)
             except ScanError as e:
                 failed[sym] = str(e)
+                details[sym] = {
+                    "symbol": sym, "status": "temporarily_unavailable",
+                    "reason": str(e), "timeframe": "%dm" % BAR_MIN,
+                }
                 continue
             full = session_bars(s2, day, cutoff)
             if not usable(full, day, cutoff, n_range):
                 failed[sym] = "the v8 chart has a missing bar"
+                details[sym] = {
+                    "symbol": sym, "status": "no_market_data",
+                    "reason": "The confirming chart did not contain every required completed bar.",
+                    "timeframe": "%dm" % BAR_MIN,
+                }
                 continue
         counts["confirmed"] += 1
         h = orb_hit(full, n_range)
         if h:
-            hits.append(dict({"symbol": sym, "setups": ["orb"]}, **h))
+            hit = dict({"symbol": sym, "setups": ["orb"]}, **h)
+            hits.append(hit)
+            details[sym] = {
+                "symbol": sym, "status": "completed",
+                "reason": "A completed five-minute bar closed above the verified opening-range high.",
+                "price": hit.get("price"), "price_as_of": hit.get("at"),
+                "volume": None, "timeframe": "%dm" % BAR_MIN, "finding": hit,
+            }
+        else:
+            details[sym] = {
+                "symbol": sym, "status": "no_qualifying_result",
+                "reason": "The full chart did not confirm a completed close above the opening-range high.",
+                "price": round(full[-1]["c"], 2) if full else None,
+                "price_as_of": full[-1]["start"].strftime("%Y-%m-%d %H:%M ET") if full else None,
+                "timeframe": "%dm" % BAR_MIN,
+            }
     hits.sort(key=lambda x: (x["_t"], x["symbol"]))
     for h in hits:
         del h["_t"]
@@ -892,13 +997,27 @@ def cmd_daily(a):
         progress(a, "Fetching daily closes for %s symbols (%d spark requests)..."
                  % ("{:,}".format(len(symbols)), (len(symbols) + SPARK_MAX - 1) // SPARK_MAX))
         data, failed = fetch_spark(symbols, "3mo", "1d", a.pause, a)
-    hits, counts, last_date = scan_daily(data, symbols, now, a.min_price, a.min_volume)
+    symbol_results = {}
+    hits, counts, last_date = scan_daily(
+        data, symbols, now, a.min_price, a.min_volume, symbol_results
+    )
+    for sym in symbols:
+        if sym not in data and failed.get(sym):
+            symbol_results[sym]["reason"] = failed[sym]
+            symbol_results[sym]["status"] = (
+                "temporarily_unavailable"
+                if "429" in failed[sym] or "rate limit" in failed[sym].lower()
+                else "unsupported_symbol"
+                if any(term in failed[sym].lower() for term in ("unsupported symbol", "symbol not found", "delisted"))
+                else "no_market_data"
+            )
     nfailed = len(symbols) - counts["fetched"]
     failed_symbols = sorted(sym for sym in symbols if sym not in data)
     as_of = ("%s close" % last_date.isoformat()) if last_date else None
     doc = {"created_by": "trader-scanner", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "mode": "daily",
            "as_of": as_of, "universe": len(symbols), "scanned": counts["scanned"], "failed": nfailed,
            "failed_symbols": failed_symbols,
+           "symbol_results": [symbol_results[s] for s in symbols],
            "source": "yahoo", "filters": {"min_price": a.min_price, "min_volume": a.min_volume},
            "note": NOTE, "hits": hits}
     if a.offline:
@@ -979,16 +1098,37 @@ def cmd_orb(a):
             if len(done) % 50 == 0:
                 progress(a, "  stage 2: %d v8 charts so far" % len(done))
             return parse_chart(yahoo_get(chart_path(sym, rng, "%dm" % BAR_MIN)), sym)
-    hits, counts, failed2 = scan_orb(data, symbols, day, cutoff, a.or_minutes, a.min_price, a.min_volume, confirm,
-                                     a.max_confirm)
+    symbol_results = {}
+    hits, counts, failed2 = scan_orb(
+        data, symbols, day, cutoff, a.or_minutes, a.min_price, a.min_volume,
+        confirm, a.max_confirm, symbol_results,
+    )
     failed = dict(failed or {})
     failed.update(failed2)
+    for sym in symbols:
+        if sym not in data and sym not in failed:
+            symbol_results.setdefault(sym, {
+                "symbol": sym, "status": "no_market_data",
+                "reason": "The data source did not return an opening-range chart.",
+                "timeframe": "%dm" % BAR_MIN,
+            })
+        if sym in failed and sym not in failed2:
+            reason = failed[sym]
+            symbol_results[sym]["reason"] = reason
+            symbol_results[sym]["status"] = (
+                "temporarily_unavailable"
+                if "429" in reason or "rate limit" in reason.lower()
+                else "unsupported_symbol"
+                if any(term in reason.lower() for term in ("unsupported symbol", "symbol not found", "delisted"))
+                else "no_market_data"
+            )
     failed_symbols = sorted(set(s for s in symbols if s not in data) | set(failed))
     nfailed = len(failed_symbols)
     as_of = "%s %s ET" % (day.isoformat(), cutoff.strftime("%H:%M"))
     doc = {"created_by": "trader-scanner", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "mode": "orb",
            "as_of": as_of, "universe": len(symbols), "scanned": counts["scanned"], "failed": nfailed,
            "failed_symbols": failed_symbols,
+           "symbol_results": [symbol_results[s] for s in symbols],
            "unconfirmed": counts["unconfirmed"], "source": "yahoo", "or_minutes": a.or_minutes,
            "interval": "%dm" % BAR_MIN,
            "filters": {"min_price": a.min_price, "min_volume": a.min_volume}, "note": NOTE, "hits": hits}

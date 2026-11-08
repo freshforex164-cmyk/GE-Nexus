@@ -24,7 +24,7 @@ MAX_ACTIONS = 4
 MAX_TOOL_OUTPUT_BYTES = 64 * 1024
 MAX_MODEL_ACTION_OUTPUT_CHARS = 6000
 MAX_TOTAL_SECONDS = 120
-TOOL_TIMEOUT_SECONDS = 25
+TOOL_TIMEOUT_SECONDS = 90
 RUNTIME_FILE_LIMIT = 1024 * 1024
 API_KEY_ENV_NAMES = (
     "OPENROUTER_API_KEY",
@@ -690,8 +690,11 @@ def _run_one(action, workspace, deadline):
         action["tool"] in ("scanner_daily", "scanner_orb")
         and completed.returncode == 1
     )
+    entry_not_triggered = (
+        action["tool"] == "entry_check" and completed.returncode == 1
+    )
     risk_block = action["tool"] == "risk_check" and completed.returncode == 1
-    if completed.returncode != 0 and not (scanner_no_match or risk_block):
+    if completed.returncode != 0 and not (scanner_no_match or risk_block or entry_not_triggered):
         result["category"] = "tool_exit_nonzero"
         result["stdout_preview"] = redact_sensitive(stdout)[:2000]
         return result
@@ -712,6 +715,12 @@ def _run_one(action, workspace, deadline):
             and data.get("mode") == action["tool"][len("scanner_"):]
             and isinstance(data.get("hits"), list)
             and not data["hits"]
+        ):
+            result["category"] = "tool_exit_nonzero"
+            result["stdout_preview"] = redact_sensitive(stdout)[:2000]
+            return result
+        if entry_not_triggered and not (
+            data.get("status") in ("waiting", "expired", "no-data")
         ):
             result["category"] = "tool_exit_nonzero"
             result["stdout_preview"] = redact_sensitive(stdout)[:2000]
