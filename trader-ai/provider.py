@@ -36,7 +36,7 @@ PROVIDERS = (
         "OPENROUTER_MODEL",
         "OPENROUTER_BASE_URL",
         "https://openrouter.ai/api/v1/chat/completions",
-        None,
+        "openai/gpt-5.6-terra",
     ),
     ProviderSpec(
         "OpenAI",
@@ -44,7 +44,7 @@ PROVIDERS = (
         "OPENAI_MODEL",
         "OPENAI_BASE_URL",
         "https://api.openai.com/v1/chat/completions",
-        None,
+        "gpt-5.6-terra",
     ),
     ProviderSpec(
         "Grok",
@@ -52,7 +52,7 @@ PROVIDERS = (
         "GROK_MODEL",
         "GROK_BASE_URL",
         "https://api.x.ai/v1/chat/completions",
-        None,
+        "grok-4.7",
     ),
     ProviderSpec(
         "DeepSeek",
@@ -60,7 +60,7 @@ PROVIDERS = (
         "DEEPSEEK_MODEL",
         "DEEPSEEK_BASE_URL",
         "https://api.deepseek.com/chat/completions",
-        None,
+        "deepseek-flash",
     ),
 )
 
@@ -170,8 +170,19 @@ def _http_category(status):
     if status == 404:
         return "model_unavailable"
     if status in (400, 422):
-        return "invalid_configuration_or_request"
+        return "invalid_request"
     return "http_error"
+
+
+def selected_model(spec, environ=None):
+    """Return the explicit override or verified server-side default."""
+    env = environ if environ is not None else os.environ
+    override = env.get(spec.model_env, "")
+    if isinstance(override, str) and override.strip():
+        return override.strip(), "override"
+    if spec.default_model:
+        return spec.default_model, "default"
+    return None, "unconfigured"
 
 
 def _response_text(raw):
@@ -214,11 +225,11 @@ def chat_completion(
             attempts.append({"provider": spec.name, "category": "missing_key"})
             continue
 
-        model = env.get(spec.model_env, "") or spec.default_model
+        model, _model_source = selected_model(spec, env)
         if not isinstance(model, str) or not model.strip():
             attempts.append({"provider": spec.name, "category": "missing_model"})
             continue
-        if model is not None and (not isinstance(model, str) or len(model) > 200):
+        if len(model) > 200:
             attempts.append({"provider": spec.name, "category": "invalid_configuration"})
             continue
 
@@ -229,7 +240,13 @@ def chat_completion(
             attempts.append({"provider": spec.name, "category": "invalid_configuration"})
             continue
 
-        payload = {"messages": checked_messages, "max_tokens": 1200, "stream": False}
+        payload = {"messages": checked_messages, "stream": False}
+        # OpenAI's current GPT-5 chat-completions API uses
+        # max_completion_tokens; the other compatible endpoints use max_tokens.
+        if spec.name == "OpenAI":
+            payload["max_completion_tokens"] = 1200
+        else:
+            payload["max_tokens"] = 1200
         if model:
             payload["model"] = model.strip()
         timeout = PROVIDER_TIMEOUT_SECONDS

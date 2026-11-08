@@ -32,6 +32,7 @@ import coordinator  # noqa: E402
 
 MAX_BODY_BYTES = 16 * 1024
 MAX_SYMBOLS = 20
+MAX_SYMBOL_LENGTH = 30
 DEFAULT_SCAN_SYMBOLS = ("AAPL", "AMZN", "GOOGL", "META", "MSFT", "NVDA", "TSLA")
 MAX_REQUESTS_PER_WINDOW = 5
 ANALYSIS_WINDOW_SECONDS = 15 * 60
@@ -207,6 +208,9 @@ def _provider_status():
         configured = has_key and has_model and endpoint_valid
         with _provider_checks_lock:
             last_check = _provider_checks.get(spec.name)
+        connection_verified = bool(
+            last_check and last_check.get("status") == "verified"
+        )
         providers.append(
             {
                 "name": spec.name,
@@ -218,16 +222,16 @@ def _provider_status():
                 "model_configured": has_model,
                 "selected_model": model,
                 "model_source": model_source,
-                "provider_available": configured,
+                "provider_available": connection_verified,
                 "configured": configured,
-                "connection_verified": (
-                    last_check.get("status") == "verified" if last_check else False
-                ),
+                "connection_verified": connection_verified,
                 "last_connection_result": last_check,
                 "state": (
                     "misconfigured"
                     if has_key and not endpoint_valid
-                    else "ready"
+                    else "verified"
+                    if connection_verified
+                    else "ready_to_test"
                     if configured
                     else "unavailable"
                 ),
@@ -357,11 +361,12 @@ _SETUP_LABELS = {
 }
 
 
-def _scan_summary(result, requested_symbols, mode):
+def _scan_summary(
+    result, valid_symbols, mode, invalid_symbols=(), duplicate_symbols=()
+):
     data = result.get("data") if isinstance(result.get("data"), dict) else {}
     counts = data.get("counts") if isinstance(data.get("counts"), dict) else {}
     hits = data.get("hits") if isinstance(data.get("hits"), list) else []
-    requested = int(data.get("universe") or len(requested_symbols))
     analyzed = int(data.get("scanned") or counts.get("scanned") or 0)
     symbol_results = data.get("symbol_results")
     if isinstance(symbol_results, list):
@@ -385,25 +390,28 @@ def _scan_summary(result, requested_symbols, mode):
             if isinstance(item, dict)
             and item.get("status") in (
                 "no_market_data", "unsupported_symbol", "temporarily_unavailable",
-                "analysis_error", "analysis_incomplete",
+                "analysis_error",
             )
             and isinstance(item.get("symbol"), str)
             and TICKER_RE.fullmatch(item["symbol"])
         ]
         failed_symbols = list(dict.fromkeys(failed_symbols + detailed_failures))[:MAX_SYMBOLS]
         errors = max(errors, len(detailed_failures))
+    partial_symbols = sum(
+        1 for item in symbol_results or []
+        if isinstance(item, dict) and item.get("status") == "analysis_incomplete"
+    )
+    requested = len(valid_symbols) + len(invalid_symbols)
+    failures = errors + len(invalid_symbols)
     if result.get("status") != "completed":
         state = "failed"
         label = "Scan failed"
-    elif analyzed == 0 and errors:
-        state = "data_unavailable"
-        label = "Data unavailable"
     elif analyzed == 0:
         state = "data_unavailable"
         label = "No usable market data"
-    elif errors or unconfirmed:
+    elif errors or partial_symbols or invalid_symbols or unconfirmed:
         state = "partial"
-        label = "Completed with partial data"
+        label = "Completed with some symbols unavailable"
     elif not hits:
         state = "no_findings"
         label = "No qualifying findings"
@@ -416,9 +424,13 @@ def _scan_summary(result, requested_symbols, mode):
         "completed_at": data.get("created_at"),
         "instruments_checked": requested,
         "instruments_analyzed": analyzed,
+        "instruments_partial": partial_symbols,
+        "instruments_failed": failures,
         "candidate_count": len(hits),
         "data_errors": errors,
         "data_error_symbols": failed_symbols,
+        "invalid_symbols": list(invalid_symbols),
+        "duplicates_removed": list(duplicate_symbols),
         "unconfirmed_candidates": unconfirmed,
         "data_source": (
             "Yahoo Finance chart data (unofficial; may be delayed)"
@@ -474,9 +486,16 @@ def _research_findings(data):
     return findings
 
 
-def _structure_scan_result(result, requested_symbols, mode):
+def _structure_scan_result(
+    result, requested_symbols, valid_symbols, mode, invalid_symbols=(), duplicate_symbols=()
+):
     data = result.get("data") if isinstance(result.get("data"), dict) else {}
-    summary = _scan_summary(result, requested_symbols, mode)
+    invalid_symbols = list(invalid_symbols)
+    duplicate_symbols = list(duplicate_symbols)
+    invalid_set = set(invalid_symbols)
+    summary = _scan_summary(
+        result, valid_symbols, mode, invalid_symbols, duplicate_symbols
+    )
     findings = _research_findings(data)
     raw_results = data.get("symbol_results")
     if not isinstance(raw_results, list):
@@ -492,6 +511,37 @@ def _structure_scan_result(result, requested_symbols, mode):
     normalized_results = []
     failed_symbols = set(summary["data_error_symbols"])
     for symbol in requested_symbols:
+        if symbol in invalid_set:
+            normalized_results.append(
+                {
+                    "symbol": symbol,
+                    "analysis_status": "invalid_symbol",
+                    "assessment": "INSUFFICIENT DATA",
+                    "assessment_note": "This entry is not a supported ticker format.",
+                    "instrument_name": None,
+                    "data_source": None,
+                    "data_timestamp": None,
+                    "latest_price": None,
+                    "market_price": None,
+                    "timeframe": None,
+                    "market_bias": None,
+                    "scanner_findings": [],
+                    "technical_indicators": {},
+                    "entry_price": None,
+                    "stop_loss": None,
+                    "take_profit": None,
+                    "invalidation": None,
+                    "historical_simulation": None,
+                    "risk": None,
+                    "data_quality": "insufficient",
+                    "tool_execution_status": "not_run",
+                    "python_signal": None,
+                    "reasons": ["Invalid ticker symbol; other valid symbols were still scanned."],
+                    "warnings": ["Invalid ticker symbol."],
+                    "tool_result": None,
+                }
+            )
+            continue
         raw = by_symbol.get(symbol, {})
         finding = findings_by_symbol.get(symbol)
         status = raw.get("status")
@@ -528,6 +578,31 @@ def _structure_scan_result(result, requested_symbols, mode):
         normalized_results.append(
             {
                 "symbol": symbol,
+                "instrument_name": raw.get("instrument_name"),
+                "data_source": data.get("source"),
+                "data_timestamp": raw.get("price_as_of") or data.get("as_of"),
+                "latest_price": raw.get("price", finding.get("price") if finding else None),
+                "market_bias": None,
+                "scanner_findings": finding.get("setups", []) if finding else [],
+                "technical_indicators": (
+                    {"rsi_14": finding.get("rsi_14")}
+                    if finding and finding.get("rsi_14") is not None else {}
+                ),
+                "invalidation": None,
+                "historical_simulation": None,
+                "data_quality": (
+                    "complete" if status in ("completed", "no_qualifying_result")
+                    else "partial" if status == "analysis_incomplete"
+                    else "insufficient"
+                ),
+                "tool_execution_status": status,
+                "python_signal": (
+                    raw.get("signal")
+                    if isinstance(raw.get("signal"), str)
+                    and raw.get("signal").upper()
+                    in ("BUY", "SELL", "WAIT", "INSUFFICIENT DATA")
+                    else None
+                ),
                 "analysis_status": status,
                 "assessment": directional,
                 "assessment_note": (
@@ -575,6 +650,18 @@ def _structure_scan_result(result, requested_symbols, mode):
     result["research_findings"] = findings
     result["symbol_results"] = normalized_results
     result["research_explanation"] = explanation
+    result["research_output"] = {
+        "status": result.get("status"),
+        "data_source": data.get("source"),
+        "timestamp": data.get("created_at"),
+        "as_of": data.get("as_of"),
+        "timeframe": data.get("interval") or ("1d" if mode == "daily" else "5m"),
+        "signal_classification": None,
+        "findings": findings,
+        "symbols": normalized_results,
+        "warnings": explanation[1:],
+        "data_quality": summary["status"],
+    }
     return result
 
 
@@ -628,7 +715,7 @@ def _automatic_scan_mode():
 
 
 def _remember_research(result):
-    """Retain bounded completed scanner/quote evidence for result-grounded questions."""
+    """Retain bounded Python evidence for an explicitly requested interpretation."""
     if result.get("status") != "completed":
         return None
     evidence = {
@@ -638,6 +725,8 @@ def _remember_research(result):
         "scan_summary": result.get("scan_summary"),
         "research_findings": result.get("research_findings"),
         "research_explanation": result.get("research_explanation"),
+        "research_output": result.get("research_output"),
+        "symbol_results": result.get("symbol_results"),
     }
     try:
         if len(json.dumps(evidence, ensure_ascii=False)) > 12000:
@@ -657,6 +746,127 @@ def _remember_research(result):
         while len(_research_contexts) > MAX_RESEARCH_CONTEXTS:
             _research_contexts.popitem(last=False)
     return research_id
+
+
+def _required_research_decision(evidence):
+    """Fix the AI's allowed decision from explicit Python output only."""
+    if not isinstance(evidence, dict) or evidence.get("status") != "completed":
+        return "INSUFFICIENT DATA"
+    summary = evidence.get("scan_summary")
+    if isinstance(summary, dict) and summary.get("status") in (
+        "data_unavailable", "failed"
+    ):
+        return "INSUFFICIENT DATA"
+
+    rows = evidence.get("symbol_results")
+    rows = rows if isinstance(rows, list) else []
+    python_signals = {
+        row.get("python_signal")
+        for row in rows
+        if isinstance(row, dict)
+        and row.get("python_signal") in ("BUY", "SELL", "WAIT", "INSUFFICIENT DATA")
+    }
+    if len(rows) == 1 and len(python_signals) == 1:
+        return next(iter(python_signals))
+    if python_signals and python_signals == {"INSUFFICIENT DATA"}:
+        return "INSUFFICIENT DATA"
+    if summary and int(summary.get("instruments_analyzed") or 0) == 0:
+        return "INSUFFICIENT DATA"
+    if rows and all(
+        isinstance(row, dict) and row.get("data_quality") == "insufficient"
+        for row in rows
+    ):
+        return "INSUFFICIENT DATA"
+    data = evidence.get("data")
+    if isinstance(data, dict) and data:
+        return "WAIT"
+    return "INSUFFICIENT DATA"
+
+
+def _python_value(document, keys):
+    if not isinstance(document, dict):
+        return None
+    for key in keys:
+        value = document.get(key)
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def _research_interpretation_output(evidence, interpretation, decision):
+    data = evidence.get("data") if isinstance(evidence.get("data"), dict) else {}
+    rows = evidence.get("symbol_results")
+    rows = rows if isinstance(rows, list) else []
+    single_row = rows[0] if len(rows) == 1 and isinstance(rows[0], dict) else {}
+    findings = evidence.get("research_findings")
+    findings = findings if isinstance(findings, list) else []
+    evidence_lines = []
+    for finding in findings[:8]:
+        if not isinstance(finding, dict):
+            continue
+        symbol = finding.get("symbol")
+        for setup in finding.get("setups", []):
+            if isinstance(setup, dict) and isinstance(setup.get("explanation"), str):
+                evidence_lines.append(
+                    (symbol + ": " if isinstance(symbol, str) else "")
+                    + setup["explanation"]
+                )
+    if not evidence_lines:
+        for row in rows[:8]:
+            if not isinstance(row, dict):
+                continue
+            for reason in row.get("reasons", [])[:2]:
+                if isinstance(reason, str):
+                    evidence_lines.append(
+                        (row.get("symbol", "") + ": " if row.get("symbol") else "")
+                        + reason
+                    )
+    warnings = []
+    if isinstance(evidence.get("research_explanation"), list):
+        warnings.extend(
+            item for item in evidence["research_explanation"]
+            if isinstance(item, str) and "unofficial" in item.lower()
+        )
+    if isinstance(summary := evidence.get("scan_summary"), dict):
+        if summary.get("data_error_symbols"):
+            warnings.append(
+                "Some symbols did not return usable market data: "
+                + ", ".join(summary["data_error_symbols"])
+            )
+        if summary.get("invalid_symbols"):
+            warnings.append(
+                "Some entries were not valid ticker symbols: "
+                + ", ".join(summary["invalid_symbols"])
+            )
+    for row in rows:
+        if isinstance(row, dict):
+            warnings.extend(
+                item for item in row.get("warnings", []) if isinstance(item, str)
+            )
+    confidence = _python_value(data, ("confidence", "confidence_score"))
+    if not isinstance(confidence, (int, float, str)) or isinstance(confidence, bool):
+        confidence = "Not calculated"
+    return {
+        "decision": decision,
+        "reason": interpretation.get("reason", ""),
+        "entry": _python_value(single_row, ("entry_price", "entry"))
+        or _python_value(data, ("entry_price", "entry"))
+        or "Not calculated",
+        "stop_loss": _python_value(single_row, ("stop_loss", "stop"))
+        or _python_value(data, ("stop_loss", "stop"))
+        or "Not calculated",
+        "take_profit": _python_value(single_row, ("take_profit", "target"))
+        or _python_value(data, ("take_profit", "target"))
+        or "Not calculated",
+        "invalidation": _python_value(single_row, ("invalidation", "invalidation_condition"))
+        or _python_value(data, ("invalidation", "invalidation_condition"))
+        or "Not available",
+        "evidence": list(dict.fromkeys(evidence_lines))[:8],
+        "confidence": confidence,
+        "data_warning": list(dict.fromkeys(warnings)) or ["No additional warning reported."],
+        "provider": interpretation.get("provider"),
+        "model": interpretation.get("model"),
+    }
 
 
 def _single_symbol(body):
@@ -746,7 +956,17 @@ def service_worker():
 
 @app.get("/api/health")
 def health():
-    return jsonify({"ok": True, "service": "ge-nexus"})
+    engine_available = all(
+        (ROOT / path).is_file()
+        for path in set(coordinator.SCRIPT_PATHS.values())
+    )
+    body = {
+        "ok": engine_available,
+        "service": "ge-nexus",
+        "backend": "healthy",
+        "engine": {"available": engine_available},
+    }
+    return jsonify(body), 200 if engine_available else 503
 
 
 @app.get("/api/status")
@@ -758,9 +978,14 @@ def status():
     return jsonify(
         {
             "service": "GE Nexus",
+            "backend": {"healthy": True},
             "engine": {
                 "available": engine_available,
                 "interface": "existing Python tools",
+            },
+            "market_data": {
+                "availability": "not_checked",
+                "source": "Yahoo Finance chart data (unofficial; may be delayed)",
             },
             "providers": _provider_status(),
             "provider_checks_are_live": False,
@@ -775,7 +1000,8 @@ def status():
                 "server_database": False,
             },
             "capabilities": {
-                "natural_language_coordination": True,
+                "natural_language_coordination": False,
+                "result_interpretation": True,
                 "market_scanner": True,
                 "broker_execution": False,
             },
@@ -817,40 +1043,11 @@ def exchange_clock():
 
 @app.post("/api/analyze")
 def analyze():
-    body, error = _json_body()
-    if error:
-        return error
-    text = body.get("request")
-    if not isinstance(text, str) or not text.strip():
-        return _api_error("invalid_request", "Enter an analysis request.", 400)
-    if len(text) > coordinator.MAX_REQUEST_CHARS:
-        return _api_error(
-            "request_too_long",
-            "Keep the analysis request to %d characters or fewer."
-            % coordinator.MAX_REQUEST_CHARS,
-            400,
-        )
-    allowed, retry_after = _limiter.allow(
-        ("analysis", _remote_key()),
-        MAX_REQUESTS_PER_WINDOW,
-        ANALYSIS_WINDOW_SECONDS,
+    return _api_error(
+        "interpretation_requires_result",
+        "Run Python research first, then use Interpret with AI on that result.",
+        410,
     )
-    if not allowed:
-        response = jsonify(
-            {
-                "error": {
-                    "category": "rate_limited",
-                    "message": "Too many analysis requests. Wait before trying again.",
-                }
-            }
-        )
-        response.status_code = 429
-        response.headers["Retry-After"] = str(retry_after)
-        return response
-
-    result = coordinator.coordinate(text)
-    status_code = 503 if result.get("status") == "unavailable" else 200
-    return jsonify(result), status_code
 
 
 @app.post("/api/scanner")
@@ -872,54 +1069,83 @@ def scan():
             "Provide 1 to %d ticker symbols." % MAX_SYMBOLS,
             400,
         )
-    normalized = [symbol.strip().upper() for symbol in symbols]
-    if any(not TICKER_RE.fullmatch(symbol) for symbol in normalized):
-        return _api_error("invalid_symbols", "One or more ticker symbols are invalid.", 400)
-    if len(set(normalized)) != len(normalized):
-        return _api_error("duplicate_symbols", "Remove duplicate ticker symbols.", 400)
-
-    allowed, retry_after = _limiter.allow(
-        ("scanner", _remote_key()), MAX_SCANS_PER_WINDOW, SCAN_WINDOW_SECONDS
-    )
-    if not allowed:
-        response = jsonify(
-            {
-                "error": {
-                    "category": "rate_limited",
-                    "message": "Too many scans. Wait before trying again.",
-                }
-            }
-        )
-        response.status_code = 429
-        response.headers["Retry-After"] = str(retry_after)
-        return response
+    normalized = []
+    valid_symbols = []
+    invalid_symbols = []
+    duplicate_symbols = []
+    seen = set()
+    for raw_symbol in symbols:
+        symbol = raw_symbol.strip().upper()[:MAX_SYMBOL_LENGTH]
+        if not symbol:
+            continue
+        if symbol in seen:
+            duplicate_symbols.append(symbol)
+            continue
+        seen.add(symbol)
+        normalized.append(symbol)
+        (valid_symbols if TICKER_RE.fullmatch(symbol) else invalid_symbols).append(symbol)
+    if not normalized:
+        return _api_error("invalid_symbols", "Enter at least one ticker symbol.", 400)
 
     mode_reason = None
-    if mode == "auto":
+    if mode == "auto" and valid_symbols:
         mode, mode_reason = _automatic_scan_mode()
-    request_text = "Scan " + " ".join(normalized)
+    elif mode == "auto":
+        mode = "daily"
+        mode_reason = "No valid ticker was supplied, so no market-data request was made."
+    request_text = "Scan " + " ".join(valid_symbols or normalized)
     tool = "scanner_daily" if mode == "daily" else "scanner_orb"
-    result, warnings = _execute_validated_action(
-        tool, {"symbols": normalized}, request_text
-    )
+    if valid_symbols:
+        allowed, retry_after = _limiter.allow(
+            ("scanner", _remote_key()), MAX_SCANS_PER_WINDOW, SCAN_WINDOW_SECONDS
+        )
+        if not allowed:
+            response = jsonify(
+                {
+                    "error": {
+                        "category": "rate_limited",
+                        "message": "Too many scans. Wait before trying again.",
+                    }
+                }
+            )
+            response.status_code = 429
+            response.headers["Retry-After"] = str(retry_after)
+            return response
+        result, warnings = _execute_validated_action(
+            tool, {"symbols": valid_symbols}, request_text
+        )
+    else:
+        result = {
+            "id": secrets.token_urlsafe(12),
+            "tool": tool,
+            "status": "completed",
+            "data": {
+                "created_by": "trader-scanner",
+                "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "mode": mode,
+                "universe": 0,
+                "scanned": 0,
+                "failed": 0,
+                "source": "yahoo",
+                "hits": [],
+                "symbol_results": [],
+            },
+        }
+        warnings = []
     result["requested_symbols"] = normalized
-    _structure_scan_result(result, normalized, mode)
+    _structure_scan_result(
+        result,
+        normalized,
+        valid_symbols,
+        mode,
+        invalid_symbols,
+        duplicate_symbols,
+    )
     if mode_reason:
         result["scan_mode_reason"] = mode_reason
-    if result.get("status") == "completed" and result["scan_summary"]["status"] not in (
-        "data_unavailable",
-        "failed",
-    ):
-        result = _interpret_action(result, request_text)
-    elif result.get("status") == "completed":
-        result["ai_status"] = "unavailable"
-        result["interpretation_error"] = {
-            "category": "insufficient_market_data",
-            "message": "There was not enough usable market data for an AI explanation.",
-        }
     if warnings:
         result["runtime_input_warnings"] = warnings
-    result["research_id"] = _remember_research(result)
+    result["research_id"] = _remember_research(result) if valid_symbols else None
     return jsonify(result)
 
 
@@ -952,28 +1178,31 @@ def analyze_instrument():
         "alerts_quote", {"symbols": [symbol]}, request_text
     )
     result["symbol"] = symbol
-    if result.get("status") == "completed":
-        result = _interpret_action(result, request_text)
     if warnings:
         result["runtime_input_warnings"] = warnings
     result["research_id"] = _remember_research(result)
     return jsonify(result)
 
 
-@app.post("/api/research/ask")
-def ask_research_question():
+@app.post("/api/research/interpret")
+def interpret_research():
     body, error = _json_body()
     if error:
         return error
     research_id = body.get("research_id")
-    question = body.get("question")
-    if not isinstance(research_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{24,64}", research_id):
+    if set(body) != {"research_id"}:
+        return _api_error(
+            "invalid_request",
+            "Choose a completed research result to interpret.",
+            400,
+        )
+    if not isinstance(research_id, str) or not re.fullmatch(
+        r"[A-Za-z0-9_-]{24,64}", research_id
+    ):
         return _api_error("invalid_research_id", "Choose a recent research result first.", 400)
-    if not isinstance(question, str) or not question.strip() or len(question) > 1000:
-        return _api_error("invalid_question", "Enter a question of 1,000 characters or fewer.", 400)
 
     allowed, retry_after = _limiter.allow(
-        ("research_question", _remote_key()),
+        ("research_interpret", _remote_key()),
         MAX_REQUESTS_PER_WINDOW,
         ANALYSIS_WINDOW_SECONDS,
     )
@@ -982,7 +1211,7 @@ def ask_research_question():
             {
                 "error": {
                     "category": "rate_limited",
-                    "message": "Too many questions. Wait before trying again.",
+                    "message": "Too many AI interpretations. Wait before trying again.",
                 }
             }
         )
@@ -999,26 +1228,35 @@ def ask_research_question():
     if not context:
         return _api_error(
             "research_context_expired",
-            "That result is no longer available for AI questions. Run the research again.",
+            "That result is no longer available for AI interpretation. Run the research again.",
             410,
         )
     try:
-        answer = coordinator.answer_research_question(
-            question,
-            context["evidence"],
+        evidence = context["evidence"]
+        required_decision = _required_research_decision(evidence)
+        interpretation = coordinator.interpret_research_result(
+            evidence,
+            required_decision,
             deadline=time.monotonic() + coordinator.MAX_TOTAL_SECONDS,
         )
     except coordinator.provider.ProviderUnavailable as exc:
         return jsonify(
             {
                 "ai_status": "unavailable",
-                "message": "AI could not answer this question. The original research result is unchanged.",
+                "message": "AI interpretation is unavailable. The original Python result is unchanged.",
                 "attempts": exc.attempts,
             }
         )
     except ValueError as exc:
-        return _api_error("invalid_question", str(exc), 400)
-    return jsonify({"ai_status": "complete", **answer})
+        return _api_error("invalid_research_result", str(exc), 422)
+    return jsonify(
+        {
+            "ai_status": "complete",
+            "interpretation": _research_interpretation_output(
+                evidence, interpretation, required_decision
+            ),
+        }
+    )
 
 
 @app.post("/api/risk")

@@ -8,12 +8,12 @@
     instrument: "/api/instrument",
     risk: "/api/risk",
     providerCheck: "/api/providers/check",
-    researchAsk: "/api/research/ask"
+    researchInterpret: "/api/research/interpret"
   };
   const routeLabels = { home: "Home", analysis: "Analysis", settings: "Settings" };
   const STORAGE_KEY = "ge-nexus-default-symbols";
   const HISTORY_STORAGE_KEY = "ge-nexus-research-history";
-  const HISTORY_LIMIT = 8;
+  const HISTORY_LIMIT = GENexusClientState.HISTORY_LIMIT;
   const view = document.getElementById("view");
   const toastRegion = document.getElementById("toast-region");
   const state = {
@@ -43,8 +43,8 @@
     providerTestBusy: false,
     settingsSymbols: null,
     settingsError: null,
-    aiAnswers: {},
-    askingResearch: {}
+    aiInterpretations: {},
+    interpretingResearch: {}
   };
 
   const icon = (name) => {
@@ -141,6 +141,12 @@
       error.url = url;
       throw error;
     }
+    if (!data || typeof data !== "object") {
+      const error = new Error("The service returned an unreadable response.");
+      error.status = response.status;
+      error.url = url;
+      throw error;
+    }
     return data;
   }
 
@@ -190,16 +196,9 @@
   function loadResearchHistory() {
     try {
       const stored = JSON.parse(localStorage.getItem(HISTORY_STORAGE_KEY) || "[]");
-      if (!Array.isArray(stored)) return [];
-      return stored.filter((item) =>
-        item && typeof item === "object" &&
-        item.status === "completed" &&
-        item.data !== undefined
-      ).slice(-HISTORY_LIMIT).map((item) => {
-        const saved = { ...item };
-        delete saved.research_id;
-        return saved;
-      });
+      const history = GENexusClientState.expireResearchHistory(stored);
+      localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(history));
+      return history.filter((item) => item.data !== undefined);
     } catch {
       return [];
     }
@@ -207,12 +206,16 @@
 
   function persistResearchResult(result, kind) {
     if (!result || result.status !== "completed") return false;
-    const savedResult = { ...result, history_kind: kind };
+    const savedResult = {
+      ...result,
+      history_kind: kind,
+      saved_at: new Date().toISOString()
+    };
     // Server-side Q&A evidence is short-lived. Do not persist its handle where
     // it could appear usable after the server has discarded the context.
     delete savedResult.research_id;
     state.scans.push(savedResult);
-    state.scans = state.scans.slice(-HISTORY_LIMIT);
+    state.scans = GENexusClientState.expireResearchHistory(state.scans);
     try {
       let serialized = JSON.stringify(state.scans);
       while (serialized.length > 500000 && state.scans.length > 1) {
@@ -319,26 +322,43 @@
   }
 
   function interpretationPanel(result) {
-    const interpretation = result?.interpretation;
-    if (!interpretation) {
-      if (result?.interpretation_error) {
-        return `<section class="panel result-panel"><div class="result-top"><div><h3>Optional AI interpretation</h3><p>Deterministic tool output is unaffected.</p></div></div><div class="result-content"><div class="notice warning">${icon("info")}<span>Interpretation was not available for this result.</span></div>${rawDetails("Interpretation error details", result.interpretation_error)}</div></section>`;
-      }
-      return "";
+    const researchId = result?.research_id;
+    if (!researchId) return "";
+    const response = state.aiInterpretations[researchId];
+    const busy = Boolean(state.interpretingResearch[researchId]);
+    const button = `<button class="button button-secondary" type="button" data-interpret-research data-research-id="${esc(researchId)}" ${busy ? "disabled" : ""}>${busy ? "Interpreting…" : "Interpret with AI"}</button>`;
+    if (!response) {
+      return `<section class="panel result-panel interpretation-panel"><div class="result-top"><div><h3>Optional AI interpretation</h3><p>Runs only when you request it. Python results remain unchanged.</p></div><span class="provider-tag">AI is optional</span></div><div class="result-content">${button}</div></section>`;
     }
-    const parts = [];
-    if (interpretation.summary) parts.push(`<p class="result-summary">${esc(interpretation.summary)}</p>`);
-    if (Array.isArray(interpretation.reported_facts) && interpretation.reported_facts.length) {
-      parts.push(`<h4 class="result-section">Reported facts</h4><ul class="result-list">${interpretation.reported_facts.map((fact) => `<li>${esc(asText(fact))}</li>`).join("")}</ul>`);
+    if (response.ai_status !== "complete") {
+      const attempts = Array.isArray(response.attempts) ? response.attempts : [];
+      return `<section class="panel result-panel interpretation-panel"><div class="result-top"><div><h3>Optional AI interpretation</h3><p>The original Python result is unchanged.</p></div></div><div class="result-content"><div class="notice warning">${icon("info")}<span>${esc(response.message || "AI interpretation is unavailable.")}</span></div>${attempts.length ? rawDetails("Provider diagnostics", attempts) : ""}${button}</div></section>`;
     }
-    if (interpretation.interpretation) parts.push(`<h4 class="result-section">Interpretation</h4><p class="result-summary">${esc(interpretation.interpretation)}</p>`);
-    if (Array.isArray(interpretation.limitations) && interpretation.limitations.length) {
-      parts.push(`<h4 class="result-section">Limitations</h4><ul class="result-list">${interpretation.limitations.map((item) => `<li>${esc(asText(item))}</li>`).join("")}</ul>`);
-    } else if (typeof interpretation.limitations === "string" && interpretation.limitations) {
-      parts.push(`<h4 class="result-section">Limitations</h4><p class="result-summary">${esc(interpretation.limitations)}</p>`);
-    }
-    if (!parts.length) parts.push('<p class="muted-detail">The provider returned no interpretation details.</p>');
-    return `<section class="panel result-panel interpretation-panel"><div class="result-top"><div><h3>Optional AI interpretation</h3><p>${result.interpretation_provider ? `Returned by ${esc(result.interpretation_provider)}` : "No provider attribution returned"}</p></div><span class="provider-tag">Interpretation only</span></div><div class="result-content">${parts.join("")}${rawDetails("Full interpretation response", interpretation)}</div></section>`;
+    const resultData = response.interpretation || {};
+    const value = (field) => {
+      const item = resultData[field];
+      return typeof item === "number" ? formatPrice(item) : esc(item ?? "Not calculated");
+    };
+    const evidence = Array.isArray(resultData.evidence) ? resultData.evidence : [];
+    const warnings = Array.isArray(resultData.data_warning) ? resultData.data_warning : [];
+    return `<section class="panel result-panel interpretation-panel">
+      <div class="result-top"><div><h3>AI interpretation</h3><p>Returned by ${esc(resultData.provider || "provider not reported")}</p></div><span class="provider-tag">Interpretation only</span></div>
+      <div class="result-content">
+        <div class="summary-grid">
+          <div class="summary-cell"><span>Research decision</span><strong>${value("decision")}</strong></div>
+          <div class="summary-cell"><span>Entry</span><strong>${value("entry")}</strong></div>
+          <div class="summary-cell"><span>Stop loss</span><strong>${value("stop_loss")}</strong></div>
+          <div class="summary-cell"><span>Take profit</span><strong>${value("take_profit")}</strong></div>
+          <div class="summary-cell"><span>Invalidation</span><strong>${value("invalidation")}</strong></div>
+          <div class="summary-cell"><span>Confidence</span><strong>${value("confidence")}</strong></div>
+        </div>
+        <h4 class="result-section">Reason</h4><p class="result-summary">${esc(resultData.reason || "No interpretation details were returned.")}</p>
+        ${evidence.length ? `<h4 class="result-section">Python evidence</h4><ul class="result-list">${evidence.map((item) => `<li>${esc(item)}</li>`).join("")}</ul>` : ""}
+        ${warnings.length ? `<h4 class="result-section">Data warning</h4><ul class="result-list">${warnings.map((item) => `<li>${esc(item)}</li>`).join("")}</ul>` : ""}
+        ${rawDetails("Provider diagnostics", resultData.attempts || [])}
+        ${button}
+      </div>
+    </section>`;
   }
 
   function formatPrice(value) {
@@ -346,26 +366,6 @@
     return Number.isFinite(number)
       ? `$${number.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
       : esc(value);
-  }
-
-  function researchQuestionForm(result) {
-    if (!result?.research_id) return "";
-    const answer = state.aiAnswers[result.research_id];
-    const busy = Boolean(state.askingResearch[result.research_id]);
-    let answerMarkup = "";
-    if (answer) {
-      if (answer.ai_status === "complete") {
-        answerMarkup = `<div class="ai-answer"><p>${esc(answer.answer)}</p>${answer.limitations?.length ? `<ul class="result-list">${answer.limitations.map((item) => `<li>${esc(item)}</li>`).join("")}</ul>` : ""}<small>AI interpretation · ${esc(answer.provider || "Provider not reported")}</small></div>`;
-      } else {
-        answerMarkup = `<div class="notice warning">${icon("info")}<span>${esc(answer.message || "AI could not answer from this result. The original research remains available.")}</span></div>`;
-      }
-    }
-    return `<form class="research-question" data-research-question data-research-id="${esc(result.research_id)}">
-      <label for="question-${esc(result.research_id)}">Ask about this result</label>
-      <div class="question-input-row"><input class="text-input" id="question-${esc(result.research_id)}" name="question" maxlength="1000" placeholder="Ask what a finding means…" required><button class="button button-secondary" type="submit" ${busy ? "disabled" : ""}>${busy ? "Thinking…" : "Ask AI"}</button></div>
-      <p class="field-help">Answers are based only on this research result. AI is optional.</p>
-      <div class="question-answer" aria-live="polite">${busy ? '<div class="skeleton skeleton-h14 skeleton-w70"></div>' : answerMarkup}</div>
-    </form>`;
   }
 
   function findingCards(result) {
@@ -448,10 +448,16 @@
     const modeLabel = data.mode === "orb" ? "Opening-range scan" : data.mode === "daily" ? "Daily-close scan" : "Market scan";
     const status = summary.status || result?.status || "unknown";
     const title = `${modeLabel}${index ? ` · ${index}` : ""}`;
-    const meta = [summary.completed_at ? `Completed ${shortDate(summary.completed_at)}` : "", summary.data_as_of ? `Data through ${summary.data_as_of}` : ""].filter(Boolean).join(" · ");
+    const dataTimestamp = summary.data_as_of || data.as_of;
+    const meta = [
+      summary.completed_at ? `Completed ${shortDate(summary.completed_at)}` : "",
+      dataTimestamp ? `Data through ${dataTimestamp} · ${GENexusClientState.ageLabel(dataTimestamp)}` : "Data timestamp unavailable"
+    ].filter(Boolean).join(" · ");
     const metrics = [
-      ["Checked", summary.instruments_checked],
-      ["Analyzed", summary.instruments_analyzed],
+      ["Requested", summary.instruments_checked],
+      ["Completed", summary.instruments_analyzed],
+      ["Partial", summary.instruments_partial],
+      ["Failed", summary.instruments_failed],
       ["Findings", summary.candidate_count],
       ["Data issues", summary.data_errors]
     ];
@@ -462,13 +468,14 @@
       <div class="result-content">
         <p class="result-callout">${esc(summary.data_source || "Market-data source not reported")}${summary.data_as_of ? ` · Data as of ${esc(summary.data_as_of)}` : ""}</p>
         <div class="summary-grid">${metrics.map(([label, value]) => `<div class="summary-cell"><span>${esc(label)}</span><strong>${esc(value ?? 0)}</strong></div>`).join("")}</div>
-        ${summary.status === "partial" ? `<div class="notice warning">${icon("info")}<span>Some instruments could not be checked${summary.unconfirmed_candidates ? `; ${esc(summary.unconfirmed_candidates)} possible candidates were not fully confirmed` : ""}. Counts reflect the scanner's actual response.</span></div>` : ""}
+        ${summary.status === "partial" ? `<div class="notice warning">${icon("info")}<span>Some symbols could not be fully checked${summary.unconfirmed_candidates ? `; ${esc(summary.unconfirmed_candidates)} possible candidates were not fully confirmed` : ""}. Successful results are preserved.</span></div>` : ""}
         ${summary.data_error_symbols?.length ? `<div class="notice warning">${icon("info")}<span>No data was returned for: ${esc(summary.data_error_symbols.join(", "))}. The scanner does not assume these symbols are supported or fabricate a result.</span></div>` : ""}
+        ${summary.invalid_symbols?.length ? `<div class="notice warning">${icon("info")}<span>Invalid ticker entries were skipped: ${esc(summary.invalid_symbols.join(", "))}. Valid symbols were still scanned.</span></div>` : ""}
+        ${summary.duplicates_removed?.length ? `<p class="muted-detail">Duplicate entries removed: ${esc(summary.duplicates_removed.join(", "))}.</p>` : ""}
         ${result.scan_mode_reason ? `<p class="muted-detail">${esc(result.scan_mode_reason)}</p>` : ""}
         <h4 class="result-section">Symbol-by-symbol results</h4>${symbolResultsMarkup(result)}
         ${summary.candidate_count ? `<h4 class="result-section">Qualifying findings · scanner order</h4>${findingCards(result)}` : ""}
         <h4 class="result-section">What the scan checks</h4><ul class="result-list">${explanations || "<li>The scanner did not return an explanation.</li>"}</ul>
-        <details class="details-block optional-ai"><summary>Optional AI explanation</summary>${researchQuestionForm(result)}</details>
         ${rawDetails("Technical details", result)}
       </div>
     </section>${interpretationPanel(result)}`;
@@ -550,7 +557,7 @@
         ? `${Array.isArray(checks) ? `${checks.length} checks returned. ` : ""}${body.block != null ? `${body.block} blocked. ` : ""}${body.pass != null ? `${body.pass} passed.` : ""}`.trim() || "The risk check returned a result."
         : "Instrument data was returned.";
     return `<section class="panel result-panel"><div class="result-top"><div><h3>${esc(title)}</h3><p>${esc(meta || "Tool response received")}</p></div><span class="badge ${result.status === "completed" ? "verified" : ""}">${esc(result.status || "returned")}</span></div>
-      <div class="result-content"><div class="result-callout">Based on returned data. AI interpretation is separate.</div><p class="result-summary">${esc(bodyText)}</p>${checksMarkup}${researchQuestionForm(result)}${rawDetails("Technical details", result)}</div>
+      <div class="result-content"><div class="result-callout">Based on returned data. AI interpretation is optional.</div><p class="result-summary">${esc(bodyText)}</p>${checksMarkup}${rawDetails("Technical details", result)}</div>
     </section>${interpretationPanel(result)}`;
   }
 
@@ -559,8 +566,9 @@
     return [...state.scans].reverse().map((result, index) => {
       const isScan = Boolean(result.data?.mode);
       const label = isScan ? (result.data.mode === "orb" ? "Opening range" : "Daily close") : `Quote · ${result.symbol || "Instrument"}`;
-      const date = result.data?.created_at || result.data?.as_of;
-      return `<details class="history-item"><summary><span>${esc(label)} · ${esc(result.scan_summary?.label || "Completed")}</span><small>${esc(shortDate(date) || `Saved result ${state.scans.length - index}`)}</small></summary>${isScan ? scanOutput(result) : returnedFactsPanel("Instrument quote", result, null)}</details>`;
+      const dataDate = result.scan_summary?.data_as_of || result.data?.as_of;
+      const savedAge = GENexusClientState.ageLabel(result.saved_at || result.data?.created_at);
+      return `<details class="history-item"><summary><span>${esc(label)} · ${esc(result.scan_summary?.label || "Completed")}</span><small>${esc(dataDate ? `Data ${dataDate} · ${GENexusClientState.ageLabel(dataDate)}` : `Saved ${savedAge}`)}</small></summary>${isScan ? scanOutput(result) : returnedFactsPanel("Instrument quote", result, null)}</details>`;
     }).join("");
   }
 
@@ -673,7 +681,13 @@
     if (statusResult.status === "fulfilled") {
       state.status = statusResult.value;
       state.statusError = null;
-      setConnection(true, "Local service responding");
+      const engineReady = Boolean(
+        state.status?.backend?.healthy && state.status?.engine?.available
+      );
+      setConnection(
+        engineReady,
+        engineReady ? "Research engine ready" : "Research engine unavailable"
+      );
     } else {
       state.status = null;
       state.statusError = statusResult.reason;
@@ -693,21 +707,23 @@
     const mode = new FormData(form).get("mode");
     const input = form.querySelector('[name="symbols"]').value.trim();
     state.scanInput = input;
-    const symbols = input ? formSymbols(input) : [];
-    const validation = input ? symbolsError(parseSymbols(input)) : "";
-    if (validation) {
-      state.scanMessage = validation;
+    const max = Number(state.universe?.max_symbols) || 20;
+    const parsed = input
+      ? GENexusClientState.parseScannerSymbols(input, max)
+      : { symbols: [], tooMany: false, duplicates: [] };
+    if (parsed.tooMany) {
+      state.scanMessage = `Use no more than ${max} ticker entries.`;
       render();
       form.querySelector('[name="symbols"]').focus();
       return;
     }
-    const effectiveSymbols = symbols.length
-      ? symbols
+    const effectiveSymbols = parsed.symbols.length
+      ? parsed.symbols
       : (state.universe?.default_symbols || ["AAPL", "AMZN", "GOOGL", "META", "MSFT", "NVDA", "TSLA"]);
     state.scanBusy = true;
     state.scanSymbolCount = effectiveSymbols.length;
     state.scanController = new AbortController();
-    state.scanMessage = `Submitting ${effectiveSymbols.length} instruments to the existing scanner.`;
+    state.scanMessage = `Submitting ${effectiveSymbols.length} symbols to the existing scanner${parsed.duplicates?.length ? ` · Removed duplicates: ${parsed.duplicates.join(", ")}` : ""}.`;
     state.scanError = null;
     state.scanResult = null;
     render();
@@ -856,44 +872,25 @@
     if (status) status.textContent = "Service defaults restored in this editor. Save to store them locally.";
   }
 
-  async function askResearch(form) {
-    const researchId = form.dataset.researchId;
-    const input = form.querySelector('[name="question"]');
-    const answerNode = form.querySelector(".question-answer");
-    const button = form.querySelector('button[type="submit"]');
-    const question = input.value.trim();
-    if (!question || !researchId) return;
-    state.askingResearch[researchId] = true;
-    answerNode.innerHTML = '<div class="skeleton skeleton-h14 skeleton-w70"></div>';
-    button.disabled = true;
+  async function interpretResearch(researchId) {
+    if (!researchId || state.interpretingResearch[researchId]) return;
+    state.interpretingResearch[researchId] = true;
+    render();
     try {
-      state.aiAnswers[researchId] = await api(API.researchAsk, {
+      state.aiInterpretations[researchId] = await api(API.researchInterpret, {
         method: "POST",
-        body: JSON.stringify({ research_id: researchId, question })
+        body: JSON.stringify({ research_id: researchId }),
+        timeoutMs: 120000
       });
-      if (state.aiAnswers[researchId].ai_status !== "complete") {
-        state.aiAnswers[researchId].message =
-          state.aiAnswers[researchId].message || "AI is unavailable. The original Python result is unchanged.";
-      }
     } catch (error) {
-      state.aiAnswers[researchId] = {
+      state.aiInterpretations[researchId] = {
         ai_status: "unavailable",
-        message: error.data?.error?.message || error.message
+        message: error.data?.message || error.data?.error?.message || error.message,
+        attempts: Array.isArray(error.data?.attempts) ? error.data.attempts : []
       };
     } finally {
-      delete state.askingResearch[researchId];
-      const currentForm = document.querySelector(`[data-research-id="${CSS.escape(researchId)}"]`);
-      if (currentForm) {
-        const currentAnswer = currentForm.querySelector(".question-answer");
-        const currentButton = currentForm.querySelector('button[type="submit"]');
-        if (currentAnswer) {
-          const answer = state.aiAnswers[researchId];
-          currentAnswer.innerHTML = answer.ai_status === "complete"
-            ? `<div class="ai-answer"><p>${esc(answer.answer)}</p>${answer.limitations?.length ? `<ul class="result-list">${answer.limitations.map((item) => `<li>${esc(item)}</li>`).join("")}</ul>` : ""}<small>AI interpretation · ${esc(answer.provider || "Provider not reported")}</small></div>`
-            : `<div class="notice warning">${icon("info")}<span>${esc(answer.message)}</span></div>`;
-        }
-        if (currentButton) currentButton.disabled = false;
-      }
+      delete state.interpretingResearch[researchId];
+      render();
     }
   }
 
@@ -903,8 +900,18 @@
     const go = event.target.closest("[data-go]");
     if (go) navigate(go.dataset.go, true);
     if (event.target.closest("[data-start-market-scan]")) {
-      document.querySelector("#home-scan-form")?.requestSubmit();
+      GENexusClientState.navigateToScanner(
+        (route) => navigate(route),
+        () => {
+          const form = document.getElementById("analysis-scan-form");
+          const input = form?.querySelector('[name="symbols"]');
+          form?.scrollIntoView({ behavior: "smooth", block: "start" });
+          input?.focus({ preventScroll: true });
+        }
+      );
     }
+    const interpretButton = event.target.closest("[data-interpret-research]");
+    if (interpretButton) interpretResearch(interpretButton.dataset.researchId);
     if (event.target.closest("[data-refresh]")) loadStatus();
     if (event.target.closest("#provider-check")) testProvider();
     if (event.target.closest("#risk-button") || event.target.closest("[data-retry-risk]")) runRisk();
@@ -926,9 +933,6 @@
     } else if (event.target.matches("#universe-form")) {
       event.preventDefault();
       saveUniverse(event.target);
-    } else if (event.target.matches("[data-research-question]")) {
-      event.preventDefault();
-      askResearch(event.target);
     }
   });
 
