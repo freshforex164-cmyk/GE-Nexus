@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 from collections import OrderedDict, defaultdict, deque
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -228,12 +228,14 @@ def _provider_status():
                 "last_connection_result": last_check,
                 "state": (
                     "misconfigured"
-                    if has_key and not endpoint_valid
+                    if not endpoint_valid
                     else "verified"
                     if connection_verified
                     else "ready_to_test"
                     if configured
                     else "unavailable"
+                    if not has_key or not has_model
+                    else "misconfigured"
                 ),
             }
         )
@@ -242,7 +244,12 @@ def _provider_status():
 
 def _remember_provider_check(attempts, verified_provider=None, verified_model=None):
     """Keep only safe, non-secret results from the latest ordered connection test."""
-    checked_at = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    checked_at = (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
     by_provider = {
         item.get("provider"): item.get("category")
         for item in attempts
@@ -721,6 +728,7 @@ def _remember_research(result):
     evidence = {
         "tool": result.get("tool"),
         "status": result.get("status"),
+        "symbol": result.get("symbol"),
         "data": result.get("data"),
         "scan_summary": result.get("scan_summary"),
         "research_findings": result.get("research_findings"),
@@ -729,7 +737,7 @@ def _remember_research(result):
         "symbol_results": result.get("symbol_results"),
     }
     try:
-        if len(json.dumps(evidence, ensure_ascii=False)) > 12000:
+        if len(json.dumps(evidence, ensure_ascii=False)) > 100000:
             return None
     except (TypeError, ValueError):
         return None
@@ -748,125 +756,96 @@ def _remember_research(result):
     return research_id
 
 
-def _required_research_decision(evidence):
-    """Fix the AI's allowed decision from explicit Python output only."""
-    if not isinstance(evidence, dict) or evidence.get("status") != "completed":
-        return "INSUFFICIENT DATA"
-    summary = evidence.get("scan_summary")
-    if isinstance(summary, dict) and summary.get("status") in (
-        "data_unavailable", "failed"
-    ):
-        return "INSUFFICIENT DATA"
-
-    rows = evidence.get("symbol_results")
-    rows = rows if isinstance(rows, list) else []
-    python_signals = {
-        row.get("python_signal")
-        for row in rows
-        if isinstance(row, dict)
-        and row.get("python_signal") in ("BUY", "SELL", "WAIT", "INSUFFICIENT DATA")
-    }
-    if len(rows) == 1 and len(python_signals) == 1:
-        return next(iter(python_signals))
-    if python_signals and python_signals == {"INSUFFICIENT DATA"}:
-        return "INSUFFICIENT DATA"
-    if summary and int(summary.get("instruments_analyzed") or 0) == 0:
-        return "INSUFFICIENT DATA"
-    if rows and all(
-        isinstance(row, dict) and row.get("data_quality") == "insufficient"
-        for row in rows
-    ):
-        return "INSUFFICIENT DATA"
-    data = evidence.get("data")
-    if isinstance(data, dict) and data:
-        return "WAIT"
-    return "INSUFFICIENT DATA"
-
-
 def _python_value(document, keys):
     if not isinstance(document, dict):
         return None
     for key in keys:
         value = document.get(key)
-        if value is not None and value != "":
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+        ):
             return value
     return None
 
 
-def _research_interpretation_output(evidence, interpretation, decision):
-    data = evidence.get("data") if isinstance(evidence.get("data"), dict) else {}
+def _research_interpretation_input(evidence, symbol):
+    """Build one symbol's bounded evidence and immutable fields for the model."""
     rows = evidence.get("symbol_results")
     rows = rows if isinstance(rows, list) else []
-    single_row = rows[0] if len(rows) == 1 and isinstance(rows[0], dict) else {}
+    row = next(
+        (
+            item for item in rows
+            if isinstance(item, dict) and item.get("symbol") == symbol
+        ),
+        {},
+    )
+    if not row and evidence.get("symbol") != symbol:
+        raise ValueError("The chosen symbol is not part of this completed result.")
+    data = evidence.get("data") if isinstance(evidence.get("data"), dict) else {}
     findings = evidence.get("research_findings")
     findings = findings if isinstance(findings, list) else []
-    evidence_lines = []
-    for finding in findings[:8]:
-        if not isinstance(finding, dict):
-            continue
-        symbol = finding.get("symbol")
-        for setup in finding.get("setups", []):
-            if isinstance(setup, dict) and isinstance(setup.get("explanation"), str):
-                evidence_lines.append(
-                    (symbol + ": " if isinstance(symbol, str) else "")
-                    + setup["explanation"]
-                )
-    if not evidence_lines:
-        for row in rows[:8]:
-            if not isinstance(row, dict):
-                continue
-            for reason in row.get("reasons", [])[:2]:
-                if isinstance(reason, str):
-                    evidence_lines.append(
-                        (row.get("symbol", "") + ": " if row.get("symbol") else "")
-                        + reason
-                    )
-    warnings = []
-    if isinstance(evidence.get("research_explanation"), list):
-        warnings.extend(
-            item for item in evidence["research_explanation"]
-            if isinstance(item, str) and "unofficial" in item.lower()
-        )
-    if isinstance(summary := evidence.get("scan_summary"), dict):
-        if summary.get("data_error_symbols"):
-            warnings.append(
-                "Some symbols did not return usable market data: "
-                + ", ".join(summary["data_error_symbols"])
-            )
-        if summary.get("invalid_symbols"):
-            warnings.append(
-                "Some entries were not valid ticker symbols: "
-                + ", ".join(summary["invalid_symbols"])
-            )
-    for row in rows:
-        if isinstance(row, dict):
-            warnings.extend(
-                item for item in row.get("warnings", []) if isinstance(item, str)
-            )
-    confidence = _python_value(data, ("confidence", "confidence_score"))
-    if not isinstance(confidence, (int, float, str)) or isinstance(confidence, bool):
-        confidence = "Not calculated"
-    return {
-        "decision": decision,
-        "reason": interpretation.get("reason", ""),
-        "entry": _python_value(single_row, ("entry_price", "entry"))
-        or _python_value(data, ("entry_price", "entry"))
-        or "Not calculated",
-        "stop_loss": _python_value(single_row, ("stop_loss", "stop"))
-        or _python_value(data, ("stop_loss", "stop"))
-        or "Not calculated",
-        "take_profit": _python_value(single_row, ("take_profit", "target"))
-        or _python_value(data, ("take_profit", "target"))
-        or "Not calculated",
-        "invalidation": _python_value(single_row, ("invalidation", "invalidation_condition"))
-        or _python_value(data, ("invalidation", "invalidation_condition"))
-        or "Not available",
-        "evidence": list(dict.fromkeys(evidence_lines))[:8],
-        "confidence": confidence,
-        "data_warning": list(dict.fromkeys(warnings)) or ["No additional warning reported."],
-        "provider": interpretation.get("provider"),
-        "model": interpretation.get("model"),
+    finding = next(
+        (item for item in findings if isinstance(item, dict) and item.get("symbol") == symbol),
+        None,
+    )
+    source_signal = row.get("python_signal")
+    signal = source_signal if source_signal in ("BUY", "SELL", "WAIT") else "WAIT"
+    quality = {
+        "complete": "good",
+        "partial": "limited",
+        "insufficient": "insufficient",
+    }.get(row.get("data_quality"), "insufficient")
+    if row.get("analysis_status") in (
+        "no_market_data", "unsupported_symbol", "temporarily_unavailable",
+        "analysis_error", "analysis_incomplete", "invalid_symbol",
+    ):
+        quality = "insufficient" if row.get("analysis_status") != "analysis_incomplete" else "limited"
+    # A Python signal, when present, is authoritative. The scanner currently
+    # reports findings rather than directional trade signals; those remain WAIT.
+    fields = {
+        "symbol": symbol,
+        "signal": signal,
+        "reason": "",
+        "entry_price": _python_value(row, ("entry_price", "entry"))
+        if row else _python_value(data, ("entry_price", "entry")),
+        "stop_loss": _python_value(row, ("stop_loss", "stop"))
+        if row else _python_value(data, ("stop_loss", "stop")),
+        "take_profit": _python_value(row, ("take_profit", "target"))
+        if row else _python_value(data, ("take_profit", "target")),
+        "risk_reward": _python_value(row, ("risk_reward", "reward_to_risk"))
+        if row else _python_value(data, ("risk_reward", "reward_to_risk")),
+        "confidence": _python_value(row, ("confidence", "confidence_score"))
+        if row else _python_value(data, ("confidence", "confidence_score")),
+        "data_quality": quality,
+        "missing_information": [],
+        "warnings": [],
     }
+    for key in ("entry_price", "stop_loss", "take_profit", "risk_reward", "confidence"):
+        if fields[key] is None:
+            fields["missing_information"].append(key + " was not calculated by the Python result.")
+    explanations = evidence.get("research_explanation")
+    warnings = [
+        item for item in (row.get("warnings", []) if row else [])
+        if isinstance(item, str)
+    ]
+    if isinstance(explanations, list):
+        warnings.extend(
+            item for item in explanations
+            if isinstance(item, str) and ("unofficial" in item.lower() or "delayed" in item.lower())
+        )
+    fields["warnings"] = list(dict.fromkeys(warnings))[:8]
+    selected = {
+        "status": evidence.get("status"),
+        "tool": evidence.get("tool"),
+        "symbol": symbol,
+        "data": evidence.get("data") if not row else None,
+        "symbol_result": row or None,
+        "finding": finding,
+        "scan_summary": evidence.get("scan_summary"),
+    }
+    return fields, selected
 
 
 def _single_symbol(body):
@@ -1190,10 +1169,10 @@ def interpret_research():
     if error:
         return error
     research_id = body.get("research_id")
-    if set(body) != {"research_id"}:
+    if set(body) != {"research_id", "symbol"}:
         return _api_error(
             "invalid_request",
-            "Choose a completed research result to interpret.",
+            "Choose one completed symbol result to interpret.",
             400,
         )
     if not isinstance(research_id, str) or not re.fullmatch(
@@ -1233,10 +1212,13 @@ def interpret_research():
         )
     try:
         evidence = context["evidence"]
-        required_decision = _required_research_decision(evidence)
+        symbol, error = _single_symbol(body)
+        if error:
+            return error
+        expected, symbol_evidence = _research_interpretation_input(evidence, symbol)
         interpretation = coordinator.interpret_research_result(
-            evidence,
-            required_decision,
+            symbol_evidence,
+            expected,
             deadline=time.monotonic() + coordinator.MAX_TOTAL_SECONDS,
         )
     except coordinator.provider.ProviderUnavailable as exc:
@@ -1252,9 +1234,9 @@ def interpret_research():
     return jsonify(
         {
             "ai_status": "complete",
-            "interpretation": _research_interpretation_output(
-                evidence, interpretation, required_decision
-            ),
+            "interpretation": interpretation,
+            "provider": interpretation.get("provider"),
+            "model": interpretation.get("model"),
         }
     )
 
@@ -1331,10 +1313,13 @@ def check_provider_connection():
         _remember_provider_check(attempts)
         categories = {
             "missing_key": "unavailable",
+            "missing_model": "model_not_configured",
             "authentication": "connection_failed",
-            "model_unavailable": "model_unavailable",
+            "invalid_model": "model_unavailable",
+            "invalid_request": "invalid_request",
+            "insufficient_credits": "insufficient_credits",
             "rate_limited": "temporarily_unavailable",
-            "server_error": "temporarily_unavailable",
+            "provider_outage": "temporarily_unavailable",
             "timeout": "temporarily_unavailable",
             "connection_error": "temporarily_unavailable",
             "deadline_exceeded": "temporarily_unavailable",

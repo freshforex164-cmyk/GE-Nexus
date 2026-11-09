@@ -36,7 +36,7 @@ PROVIDERS = (
         "OPENROUTER_MODEL",
         "OPENROUTER_BASE_URL",
         "https://openrouter.ai/api/v1/chat/completions",
-        "openai/gpt-5.6-terra",
+        None,
     ),
     ProviderSpec(
         "OpenAI",
@@ -44,7 +44,7 @@ PROVIDERS = (
         "OPENAI_MODEL",
         "OPENAI_BASE_URL",
         "https://api.openai.com/v1/chat/completions",
-        "gpt-5.6-terra",
+        None,
     ),
     ProviderSpec(
         "Grok",
@@ -52,7 +52,7 @@ PROVIDERS = (
         "GROK_MODEL",
         "GROK_BASE_URL",
         "https://api.x.ai/v1/chat/completions",
-        "grok-4.7",
+        None,
     ),
     ProviderSpec(
         "DeepSeek",
@@ -60,7 +60,7 @@ PROVIDERS = (
         "DEEPSEEK_MODEL",
         "DEEPSEEK_BASE_URL",
         "https://api.deepseek.com/chat/completions",
-        "deepseek-flash",
+        None,
     ),
 )
 
@@ -68,8 +68,9 @@ PROVIDERS = (
 class ProviderHTTPError(Exception):
     """HTTP status only; deliberately excludes the provider response body."""
 
-    def __init__(self, status):
+    def __init__(self, status, body=b""):
         self.status = int(status)
+        self.body = body[:8192] if isinstance(body, bytes) else b""
         Exception.__init__(self, "HTTP %d" % self.status)
 
 
@@ -146,7 +147,11 @@ def _post_json(endpoint, headers, payload, timeout):
         with opener.open(request, timeout=timeout) as response:
             raw = response.read(MAX_RESPONSE_BYTES + 1)
     except HTTPError as exc:
-        raise ProviderHTTPError(exc.code)
+        try:
+            error_body = exc.read(8192)
+        except OSError:
+            error_body = b""
+        raise ProviderHTTPError(exc.code, error_body)
     except (socket.timeout, TimeoutError):
         raise
     except URLError as exc:
@@ -160,28 +165,40 @@ def _post_json(endpoint, headers, payload, timeout):
     return raw
 
 
-def _http_category(status):
+def _http_category(status, body=b""):
+    """Classify common provider errors without returning their raw bodies."""
+    if isinstance(body, bytes):
+        text = body.decode("utf-8", errors="ignore").lower()
+    else:
+        text = ""
+    if status == 402 or any(
+        phrase in text
+        for phrase in ("insufficient_quota", "insufficient credits", "billing hard limit")
+    ):
+        return "insufficient_credits"
     if status in (401, 403):
         return "authentication"
     if status == 429:
         return "rate_limited"
+    if status in (408, 504):
+        return "timeout"
     if 500 <= status <= 599:
-        return "server_error"
+        return "provider_outage"
     if status == 404:
-        return "model_unavailable"
+        return "invalid_model"
     if status in (400, 422):
+        if any(phrase in text for phrase in ("model_not_found", "model not found", "unknown model")):
+            return "invalid_model"
         return "invalid_request"
-    return "http_error"
+    return "provider_error"
 
 
 def selected_model(spec, environ=None):
-    """Return the explicit override or verified server-side default."""
+    """Return only an explicitly configured model identifier."""
     env = environ if environ is not None else os.environ
     override = env.get(spec.model_env, "")
     if isinstance(override, str) and override.strip():
         return override.strip(), "override"
-    if spec.default_model:
-        return spec.default_model, "default"
     return None, "unconfigured"
 
 
@@ -247,6 +264,10 @@ def chat_completion(
             payload["max_completion_tokens"] = 1200
         else:
             payload["max_tokens"] = 1200
+        if spec.name == "DeepSeek":
+            # Keep short JSON requests from spending their small output budget
+            # on reasoning tokens. This is DeepSeek's documented chat format.
+            payload["thinking"] = {"type": "disabled"}
         if model:
             payload["model"] = model.strip()
         timeout = PROVIDER_TIMEOUT_SECONDS
@@ -261,13 +282,19 @@ def chat_completion(
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
+        if spec.name == "OpenRouter":
+            headers["HTTP-Referer"] = "https://ge-nexus.replit.app"
+            headers["X-OpenRouter-Title"] = "GE Nexus"
 
         try:
             raw = post(endpoint, headers, payload, timeout)
             content = _response_text(raw)
         except ProviderHTTPError as exc:
             attempts.append(
-                {"provider": spec.name, "category": _http_category(exc.status)}
+                {
+                    "provider": spec.name,
+                    "category": _http_category(exc.status, exc.body),
+                }
             )
             continue
         except TimeoutError:

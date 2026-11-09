@@ -6,8 +6,8 @@
   "use strict";
 
   const TICKER_RE = /^[A-Z][A-Z0-9]{0,4}(?:[.-][A-Z])?$/;
-  const HISTORY_LIMIT = 8;
-  const HISTORY_TTL_MS = 72 * 60 * 60 * 1000;
+  const HISTORY_LIMIT = 7;
+  const MARKET_DATA_STALE_MS = 72 * 60 * 60 * 1000;
 
   function parseScannerSymbols(value, maxSymbols = 20) {
     const tokens = String(value || "").split(/[,\s]+/).map((item) => item.trim()).filter(Boolean);
@@ -67,9 +67,7 @@
     if (!Array.isArray(records)) return [];
     return records
       .filter((item) => {
-        if (!item || typeof item !== "object" || item.status !== "completed") return false;
-        const timestamp = recordTimestamp(item);
-        return timestamp !== null && timestamp <= now && now - timestamp <= HISTORY_TTL_MS;
+        return Boolean(item && typeof item === "object" && item.status === "completed");
       })
       .slice(-HISTORY_LIMIT)
       .map((item) => {
@@ -77,6 +75,12 @@
         delete saved.research_id;
         return saved;
       });
+  }
+
+  function isStaleMarketData(value, now = Date.now()) {
+    const timestamp = parseDate(value || "");
+    return Number.isFinite(timestamp) && timestamp <= now &&
+      now - timestamp > MARKET_DATA_STALE_MS;
   }
 
   function ageLabel(value, now = Date.now()) {
@@ -97,9 +101,10 @@
 
   return {
     HISTORY_LIMIT,
-    HISTORY_TTL_MS,
+    MARKET_DATA_STALE_MS,
     ageLabel,
     expireResearchHistory,
+    isStaleMarketData,
     navigateToScanner,
     parseScannerSymbols
   };
